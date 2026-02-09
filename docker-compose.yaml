@@ -1,0 +1,15 @@
+services:
+  rabbitmq:
+    image: rabbitmq:4.0-management
+    container_name: sync-broker
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+    healthcheck:
+      test: [ "CMD", "rabbitmq-diagnostics", "check-running" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
