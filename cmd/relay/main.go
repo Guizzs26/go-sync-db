@@ -30,50 +30,79 @@ func main() {
 	}
 	defer postgres.Close()
 
-	rabbitmq, err := broker.NewRabbitMQClient(cfg.RabbitMQURL, logger)
-	if err != nil {
-		slog.Error("Fatal error connecting to RabbitMQ", "error", err)
-		os.Exit(1)
-	}
-	defer rabbitmq.Close()
-
-	syncService := service.NewSyncService(postgres, rabbitmq, logger)
-
 	dlqDone := make(chan struct{})
 	go runMaintenance(ctx, postgres, cfg.MaintenanceInterval, dlqDone)
 
 	slog.Info("🚀 Sentinel Relay Service started", "pid", os.Getpid())
-	runMainLoop(ctx, syncService, cfg, dlqDone)
+
+	runMainLoop(ctx, postgres, cfg, dlqDone)
 }
 
-func runMainLoop(ctx context.Context, s *service.SyncService, cfg *config.Config, dlqDone chan struct{}) {
+func runMainLoop(ctx context.Context, repo *db.PostgresRepository, cfg *config.Config, dlqDone chan struct{}) {
 	backoff := service.NewBackoff(1*time.Second, 60*time.Second, 2.0)
+	var rabbitmq *broker.RabbitMQClient
+	var syncService *service.SyncService
 
 	for {
 		select {
 		case <-ctx.Done():
 			slog.Info("👋 Shutting down main loop...")
-			<-dlqDone // Block until maintenance finishes current task
+			if rabbitmq != nil {
+				rabbitmq.Close()
+			}
+			<-dlqDone // Espera a limpeza terminar
 			slog.Info("✅ Shutdown complete")
 			return
 		default:
-			if err := s.ProcessNextBatch(ctx, cfg.BatchSize); err != nil {
+			// 1. Lifecycle: Garante que o Broker está operante
+			if rabbitmq == nil || !rabbitmq.IsHealthy() {
+				if rabbitmq != nil {
+					rabbitmq.Close()
+				}
+
+				// Tentativa de conexão (incluindo a primeira do boot)
+				newRabbit, err := broker.NewRabbitMQClient(cfg.RabbitMQURL, slog.Default())
+				if err != nil {
+					wait := backoff.Next()
+					slog.Error("RabbitMQ link failure, retrying", "wait", wait, "error", err)
+
+					select {
+					case <-time.After(wait):
+						continue // Tenta novamente após o backoff
+					case <-ctx.Done():
+						return
+					}
+				}
+
+				slog.Info("RabbitMQ link established 🚀")
+				rabbitmq = newRabbit
+				backoff.Reset()
+				// Recria o serviço para injetar o novo cliente saudável
+				syncService = service.NewSyncService(repo, rabbitmq, slog.Default())
+			}
+
+			// Execution: Processa o lote
+			if err := syncService.ProcessNextBatch(ctx, cfg.BatchSize); err != nil {
 				wait := backoff.Next()
-				slog.Error("Batch processing error",
-					"attempt", backoff.Attempts(),
-					"retry_in", wait,
-					"error", err,
-				)
+				slog.Error("Batch processing error", "retry_in", wait, "error", err)
 
 				select {
 				case <-time.After(wait):
-					continue
+					continue // Mantém o backoff se falhar
 				case <-ctx.Done():
 					return
 				}
 			}
+
+			// 4. Sucesso: Reseta backoff e aguarda próximo ciclo (PollInterval)
 			backoff.Reset()
-			time.Sleep(cfg.PollInterval)
+
+			select {
+			case <-time.After(cfg.PollInterval):
+				continue
+			case <-ctx.Done():
+				return
+			}
 		}
 	}
 }

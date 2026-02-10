@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/Guizzs26/go-sync-db/internal/models"
 
@@ -13,9 +16,15 @@ import (
 
 // RabbitMQClient handles the low-level communication with the message broker
 type RabbitMQClient struct {
-	conn    *amqp.Connection
-	channel *amqp.Channel
-	logger  *slog.Logger
+	conn       *amqp.Connection
+	channel    *amqp.Channel
+	logger     *slog.Logger
+	connClosed chan *amqp.Error
+	chanClosed chan *amqp.Error
+	closeOnce  sync.Once
+	healthy    atomic.Bool
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
 // NewRabbitMQClient initializes a connection and a channel, enabling Publisher Confirms by default
@@ -27,6 +36,7 @@ func NewRabbitMQClient(url string, l *slog.Logger) (*RabbitMQClient, error) {
 
 	ch, err := c.Channel()
 	if err != nil {
+		c.Close()
 		return nil, fmt.Errorf("failed to open RabbitMQ channel: %v", err)
 	}
 
@@ -39,23 +49,55 @@ func NewRabbitMQClient(url string, l *slog.Logger) (*RabbitMQClient, error) {
 		false,
 		nil,
 	); err != nil {
+		ch.Close()
+		c.Close()
 		return nil, fmt.Errorf("failed to declare topic exchange: %v", err)
 	}
 
 	if err := ch.Confirm(false); err != nil {
+		ch.Close()
+		c.Close()
 		return nil, fmt.Errorf("failed to activate Publisher Confirms: %v", err)
 	}
 
-	l.Info("Successfully connected to RabbitMQ", "url", url)
-	return &RabbitMQClient{
-		conn:    c,
-		channel: ch,
-		logger:  l,
-	}, nil
+	ctx, cancel := context.WithCancel(context.Background())
+	client := &RabbitMQClient{
+		conn:       c,
+		channel:    ch,
+		logger:     l,
+		connClosed: make(chan *amqp.Error, 1),
+		chanClosed: make(chan *amqp.Error, 1),
+		ctx:        ctx,
+		cancel:     cancel,
+	}
+
+	client.healthy.Store(true)
+	client.conn.NotifyClose(client.connClosed)
+	client.channel.NotifyClose(client.chanClosed)
+
+	go func() {
+		select {
+		case err := <-client.connClosed:
+			client.healthy.Store(false)
+			l.Warn("RabbitMQ connection closed", "error", err)
+		case err := <-client.chanClosed:
+			client.healthy.Store(false)
+			l.Warn("RabbitMQ channel closed", "error", err)
+		case <-client.ctx.Done():
+			return
+		}
+	}()
+
+	l.Info("Successfully connected to RabbitMQ and monitors established", "url", url)
+	return client, nil
 }
 
 // Publish sends an entry to the broker and blocks until a confirmation (ACK/NACK) is received
 func (r *RabbitMQClient) Publish(ctx context.Context, routingKey string, entry models.OutboxEntry) error {
+	if !r.IsHealthy() {
+		return fmt.Errorf("broker connection is closed")
+	}
+
 	body, err := json.Marshal(entry)
 	if err != nil {
 		return fmt.Errorf("failed to serialize entry: %v", err)
@@ -86,23 +128,35 @@ func (r *RabbitMQClient) Publish(ctx context.Context, routingKey string, entry m
 		return fmt.Errorf("publish call failed: %v", err)
 	}
 
-	if !deferred.Wait() {
-		l.Error("RabbitMQ returned NACK (persistence failure)")
-		return fmt.Errorf("RabbitMQ NACK for correlation_id: %s", entry.CorrelationID)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-deferred.Done():
+		if !deferred.Acked() {
+			return fmt.Errorf("RabbitMQ NACK received: message not persisted")
+		}
+		return nil
+	case <-time.After(10 * time.Second):
+		return fmt.Errorf("publisher confirm timeout")
 	}
-
-	l.Debug("Message confirmed by broker")
-	return nil
 }
 
 // Close gracefully shuts down the RabbitMQ resources
-func (r *RabbitMQClient) Close() {
-	if r.channel != nil {
-		r.logger.Info("Closing RabbitMQ channel")
-		r.channel.Close()
-	}
-	if r.conn != nil {
-		r.logger.Info("Disconnecting from RabbitMQ")
-		r.conn.Close()
-	}
+func (r *RabbitMQClient) Close() error {
+	r.closeOnce.Do(func() {
+		r.logger.Info("Terminating RabbitMQ client")
+		r.cancel()
+		if r.channel != nil {
+			r.channel.Close()
+		}
+		if r.conn != nil {
+			r.conn.Close()
+		}
+	})
+	return nil
+}
+
+// IsHealthy returns true if the connection and channel are active
+func (r *RabbitMQClient) IsHealthy() bool {
+	return r.healthy.Load()
 }

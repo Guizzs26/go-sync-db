@@ -36,68 +36,71 @@ func NewPostgresRepository(ctx context.Context, connString string, logger *slog.
 	}, nil
 }
 
-// FetchAndClaim picks pending or stale messages and marks them as 'processing' in a single transaction
+// FetchAndClaim captures a batch of messages and marks them as 'processing' atomically.
+// This implementation uses a single CTE for picking and updating, preventing duplicates
+// and ensuring the highest possible throughput for the Outbox pattern.
 func (r *PostgresRepository) FetchAndClaim(ctx context.Context, batchSize int) ([]models.OutboxEntry, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to begin transaction: %v", err)
+		return nil, fmt.Errorf("failed to start fetch transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
-	// CTE Strategy:
-	// 1. Get new pending messages
-	// 2. Get stale messages that were 'processing' for too long (rescue logic)
+	// Query explanation:
+	// 1. The 'target_ids' CTE selects IDs using FOR UPDATE SKIP LOCKED to ensure exclusive access.
+	// 2. We prioritize 'pending' messages but also recover 'processing' ones older than 5 min.
+	// 3. The main UPDATE statement marks them as 'processing' and increments attempts.
+	// 4. RETURNING returns the full rows, avoiding a second SELECT query.
 	query := `
-        WITH candidates AS (
-            (SELECT id, correlation_id, unit_id, table_name, operation, payload, attempts
-             FROM pg_sync_outbox
-             WHERE status = 'pending' AND attempts < 5
-             ORDER BY created_at ASC LIMIT $1)
-            UNION ALL
-            (SELECT id, correlation_id, unit_id, table_name, operation, payload, attempts
-             FROM pg_sync_outbox
-             WHERE status = 'processing' AND updated_at < NOW() - INTERVAL '5 minutes' AND attempts < 5
-             ORDER BY updated_at ASC LIMIT $1)
-            LIMIT $1
-        )
-        SELECT * FROM candidates FOR UPDATE SKIP LOCKED`
+		WITH target_ids AS (
+			SELECT id 
+			FROM pg_sync_outbox 
+			WHERE (
+				(status = 'pending' AND attempts < 5)
+				OR 
+				(status = 'processing' AND updated_at < NOW() - INTERVAL '5 minutes' AND attempts < 5)
+			)
+			ORDER BY 
+				CASE WHEN status = 'pending' THEN 0 ELSE 1 END,
+				created_at ASC
+			LIMIT $1
+			FOR UPDATE SKIP LOCKED
+		)
+		UPDATE pg_sync_outbox o
+		SET status = 'processing',
+		    attempts = o.attempts + 1,
+		    updated_at = NOW()
+		FROM target_ids
+		WHERE o.id = target_ids.id
+		RETURNING o.id, o.correlation_id, o.unit_id, o.table_name, o.operation, o.payload, o.attempts;
+	`
 
 	rows, err := tx.Query(ctx, query, batchSize)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query outbox candidates: %v", err)
+		return nil, fmt.Errorf("failed to claim outbox batch: %v", err)
 	}
 	defer rows.Close()
 
 	var entries []models.OutboxEntry
-	var ids []int64
-
 	for rows.Next() {
 		var e models.OutboxEntry
-		err := rows.Scan(&e.ID, &e.CorrelationID, &e.UnitID, &e.TableName, &e.Operation, &e.Payload, &e.Attempts)
+		err := rows.Scan(
+			&e.ID,
+			&e.CorrelationID,
+			&e.UnitID,
+			&e.TableName,
+			&e.Operation,
+			&e.Payload,
+			&e.Attempts,
+		)
 		if err != nil {
-			return nil, fmt.Errorf("failed to scan outbox row: %v", err)
+			return nil, fmt.Errorf("failed to scan outbox entry: %v", err)
 		}
 		entries = append(entries, e)
-		ids = append(ids, e.ID)
-	}
-
-	if len(ids) == 0 {
-		return nil, nil
-	}
-
-	// Atomic update to prevent other instances from picking the same batch
-	if _, err = tx.Exec(ctx, `
-        UPDATE pg_sync_outbox 
-        SET status = 'processing',
-            attempts = attempts + 1,
-            updated_at = NOW()
-        WHERE id = ANY($1)`, ids,
-	); err != nil {
-		return nil, fmt.Errorf("failed to claim messages: %v", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("failed to commit transaction: %v", err)
+		return nil, fmt.Errorf("failed to commit batch claim: %w", err)
 	}
 
 	return entries, nil
@@ -126,6 +129,19 @@ func (r *PostgresRepository) MarkAsPending(ctx context.Context, id int64, errLog
 		return fmt.Errorf("failed to mark as pending (ID: %v): %v", id, err)
 	}
 	return nil
+}
+
+func (r *PostgresRepository) MarkManyAsPending(ctx context.Context, ids []int64, reason string) error {
+	query := `
+        UPDATE pg_sync_outbox 
+        SET status = 'pending', 
+            attempts = attempts + 1, 
+            error_log = $1, 
+            updated_at = NOW() 
+        WHERE id = ANY($2)`
+
+	_, err := r.pool.Exec(ctx, query, "Batch Aborted: "+reason, ids)
+	return err
 }
 
 func (r *PostgresRepository) MoveToDLQ(ctx context.Context) error {
