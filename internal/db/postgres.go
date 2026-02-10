@@ -31,7 +31,6 @@ func NewPostgresRepository(ctx context.Context, connString string) (*PostgresRep
 	return &PostgresRepository{pool: p}, nil
 }
 
-// FetchPending busca registros que ainda não foram sincronizados
 func (r *PostgresRepository) FetchPending(ctx context.Context, batchSize int) ([]models.OutboxEntry, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -48,7 +47,7 @@ func (r *PostgresRepository) FetchPending(ctx context.Context, batchSize int) ([
         FOR UPDATE SKIP LOCKED
     `
 
-	rows, err := tx.Query(ctx, query, batchSize) // ← USA TX!
+	rows, err := tx.Query(ctx, query, batchSize)
 	if err != nil {
 		return nil, fmt.Errorf("falha ao buscar pendências: %w", err)
 	}
@@ -79,7 +78,6 @@ func (r *PostgresRepository) FetchPending(ctx context.Context, batchSize int) ([
 	return entries, nil
 }
 
-// MarkAsSent atualiza o status para sucesso após o ACK do RabbitMQ
 func (r *PostgresRepository) MarkAsSent(ctx context.Context, id int64) error {
 	query := `
 		UPDATE pg_sync_outbox 
@@ -90,7 +88,6 @@ func (r *PostgresRepository) MarkAsSent(ctx context.Context, id int64) error {
 	return err
 }
 
-// MarkAsError registra falhas e incrementa tentativas
 func (r *PostgresRepository) MarkAsError(ctx context.Context, id int64, errLog string) error {
 	query := `
 		UPDATE pg_sync_outbox 
@@ -104,7 +101,6 @@ func (r *PostgresRepository) MarkAsError(ctx context.Context, id int64, errLog s
 	return err
 }
 
-// Close fecha o pool de conexões
 func (r *PostgresRepository) Close() {
 	r.pool.Close()
 }

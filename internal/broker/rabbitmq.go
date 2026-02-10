@@ -48,27 +48,26 @@ func (r *RabbitMQClient) Publish(ctx context.Context, routingKey string, entry m
 
 	if err = r.channel.PublishWithContext(
 		ctx,
-		"pax.direct", // Exchange nominal que definimos no setup
-		routingKey,   // pax.unit.{id}.{table}.{op}
-		false,        // mandatory
-		false,        // immediate
+		"pax.direct",
+		routingKey, // pax.unit.{id}.{table}.{op}
+		false,
+		false,
 		amqp.Publishing{
 			Headers: amqp.Table{
-				"correlation_id": entry.CorrelationID, // Rastreabilidade total
+				"correlation_id": entry.CorrelationID,
 			},
 			ContentType:  "application/json",
-			DeliveryMode: amqp.Persistent, // MENSAGEM PERSISTENTE (Fase 03)
+			DeliveryMode: amqp.Persistent,
 			Body:         body,
 		},
 	); err != nil {
 		return fmt.Errorf("erro ao disparar publish: %w", err)
 	}
 
-	// BLOQUEIO SEGURO: Espera o recibo do RabbitMQ (Publisher Confirm)
 	select {
 	case confirmed := <-r.confirms:
 		if confirmed.Ack {
-			return nil // Sucesso absoluto! O dado tocou o disco do broker.
+			return nil
 		}
 		return fmt.Errorf("RabbitMQ enviou NACK para correlation_id: %s", entry.CorrelationID)
 	case <-ctx.Done():
@@ -76,7 +75,6 @@ func (r *RabbitMQClient) Publish(ctx context.Context, routingKey string, entry m
 	}
 }
 
-// Close garante o fechamento limpo das conexões
 func (r *RabbitMQClient) Close() {
 	if r.channel != nil {
 		r.channel.Close()

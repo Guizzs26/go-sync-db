@@ -48,17 +48,14 @@ func main() {
 			log.Println("👋 Encerrando Relay Service de forma graciosa...")
 			return
 		default:
-			// 1. Tenta processar um lote de mensagens
 			err := syncService.ProcessNextBatch(ctx)
 
 			if err != nil {
 				log.Printf("⚠️ Erro crítico: %v", err)
-				time.Sleep(5 * time.Second) // Backoff para não floodar o log
+				time.Sleep(5 * time.Second)
 				continue
 			}
 
-			// 2. Intervalo entre pollings (ajuste conforme necessidade)
-			// Se o lote anterior estava cheio, poderíamos até pular o sleep
 			time.Sleep(1 * time.Second)
 		}
 	}
