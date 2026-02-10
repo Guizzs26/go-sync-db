@@ -9,14 +9,6 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-type Order struct {
-	ID        string  `json:"id"`
-	Customer  string  `json:"customer"`
-	Amount    float64 `json:"amount"`
-	Status    string  `json:"status"`
-	Timestamp string  `json:"timestamp"`
-}
-
 func main() {
 	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
 	if err != nil {
@@ -47,7 +39,7 @@ func main() {
 	}
 
 	order := Order{
-		ID:        "PED-12345",
+		ID:        "PED-ERRO",
 		Customer:  "Pax Primavera",
 		Amount:    2500.75,
 		Status:    "pending",
