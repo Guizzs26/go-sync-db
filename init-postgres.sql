@@ -17,6 +17,22 @@ CREATE TABLE pg_sync_outbox (
 CREATE INDEX idx_outbox_status_pending ON pg_sync_outbox(status) WHERE status = 'pending';
 CREATE INDEX idx_outbox_created_at ON pg_sync_outbox(created_at);
 
+CREATE TABLE pg_sync_dlq (
+    id BIGSERIAL PRIMARY KEY,
+    correlation_id UUID NOT NULL,
+    unit_id INT NOT NULL,
+    table_name VARCHAR(50) NOT NULL,
+    operation CHAR(1) NOT NULL,
+    payload JSONB NOT NULL,
+    attempts INT NOT NULL,
+    error_log TEXT,
+    failed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_outbox_processing_stale 
+ON pg_sync_outbox(status, updated_at) 
+WHERE status = 'processing';
+
 CREATE TABLE customers (
     id SERIAL PRIMARY KEY,
     fb_id INT, -- Legacy Firebird ID

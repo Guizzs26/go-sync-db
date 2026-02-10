@@ -31,7 +31,7 @@ func NewPostgresRepository(ctx context.Context, connString string) (*PostgresRep
 	return &PostgresRepository{pool: p}, nil
 }
 
-func (r *PostgresRepository) FetchPending(ctx context.Context, batchSize int) ([]models.OutboxEntry, error) {
+func (r *PostgresRepository) FetchAndClaim(ctx context.Context, batchSize int) ([]models.OutboxEntry, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -39,12 +39,19 @@ func (r *PostgresRepository) FetchPending(ctx context.Context, batchSize int) ([
 	defer tx.Rollback(ctx)
 
 	query := `
-        SELECT id, correlation_id, unit_id, table_name, operation, payload, attempts
-        FROM pg_sync_outbox
-        WHERE status = 'pending'
-        ORDER BY created_at ASC
-        LIMIT $1
-        FOR UPDATE SKIP LOCKED
+        WITH candidates AS (
+            (SELECT id, correlation_id, unit_id, table_name, operation, payload, attempts
+             FROM pg_sync_outbox
+             WHERE status = 'pending' AND attempts < 5
+             ORDER BY created_at ASC LIMIT $1)
+            UNION ALL
+            (SELECT id, correlation_id, unit_id, table_name, operation, payload, attempts
+             FROM pg_sync_outbox
+             WHERE status = 'processing' AND updated_at < NOW() - INTERVAL '5 minutes' AND attempts < 5
+             ORDER BY updated_at ASC LIMIT $1)
+            LIMIT $1
+        )
+        SELECT * FROM candidates FOR UPDATE SKIP LOCKED
     `
 
 	rows, err := tx.Query(ctx, query, batchSize)
@@ -54,25 +61,42 @@ func (r *PostgresRepository) FetchPending(ctx context.Context, batchSize int) ([
 	defer rows.Close()
 
 	var entries []models.OutboxEntry
+	var ids []int64
+
 	for rows.Next() {
-		var entry models.OutboxEntry
+		var e models.OutboxEntry
 		err := rows.Scan(
-			&entry.ID,
-			&entry.CorrelationID,
-			&entry.UnitID,
-			&entry.TableName,
-			&entry.Operation,
-			&entry.Payload,
-			&entry.Attempts,
+			&e.ID,
+			&e.CorrelationID,
+			&e.UnitID,
+			&e.TableName,
+			&e.Operation,
+			&e.Payload,
+			&e.Attempts,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("erro no scan da outbox: %w", err)
 		}
-		entries = append(entries, entry)
+		entries = append(entries, e)
+		ids = append(ids, e.ID)
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	if _, err = tx.Exec(ctx, `
+        UPDATE pg_sync_outbox 
+        SET status = 'processing',
+            attempts = attempts + 1,
+            updated_at = NOW()
+        WHERE id = ANY($1)
+    `, ids,
+	); err != nil {
+		return nil, fmt.Errorf("erro ao reivindicar mensagens: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("erro ao commitar transação: %w", err)
+		return nil, fmt.Errorf("erro ao commitar: %w", err)
 	}
 
 	return entries, nil
@@ -103,4 +127,36 @@ func (r *PostgresRepository) MarkAsError(ctx context.Context, id int64, errLog s
 
 func (r *PostgresRepository) Close() {
 	r.pool.Close()
+}
+
+func (r *PostgresRepository) MarkAsPending(ctx context.Context, id int64, errLog string) error {
+	query := `
+        UPDATE pg_sync_outbox 
+        SET status = 'pending',
+            error_log = $2,
+            updated_at = CURRENT_TIMESTAMP 
+        WHERE id = $1
+    `
+	_, err := r.pool.Exec(ctx, query, id, errLog)
+	return err
+}
+
+func (r *PostgresRepository) MoveToDLQ(ctx context.Context) error {
+	query := `
+        WITH moved AS (
+            DELETE FROM pg_sync_outbox
+            WHERE attempts >= 5
+            RETURNING *
+        )
+        INSERT INTO pg_sync_dlq (
+            correlation_id, unit_id, table_name, operation, 
+            payload, attempts, error_log, failed_at
+        )
+        SELECT 
+            correlation_id, unit_id, table_name, operation,
+            payload, attempts, error_log, NOW()
+        FROM moved
+    `
+	_, err := r.pool.Exec(ctx, query)
+	return err
 }

@@ -40,16 +40,39 @@ func main() {
 
 	syncService := service.NewSyncService(postgres, rabbitmq)
 
+	dlqDone := make(chan struct{})
+	go func() {
+		defer close(dlqDone)
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				log.Println("Sweep: Iniciando limpeza da Outbox (Moving to DLQ)...")
+				if err := postgres.MoveToDLQ(ctx); err != nil {
+					log.Printf("⚠️ Erro na manutenção da DLQ: %v", err)
+				}
+			case <-ctx.Done():
+				log.Println("🛑 Parando goroutine da DLQ...")
+				return
+			}
+		}
+	}()
+
 	log.Println("🚀 Relay Service iniciado. Monitorando pg_sync_outbox...")
 
 	for {
 		select {
 		case <-ctx.Done():
 			log.Println("👋 Encerrando Relay Service de forma graciosa...")
+
+			<-dlqDone
+			log.Println("✅ Shutdown finalizado com sucesso.")
 			return
+
 		default:
 			err := syncService.ProcessNextBatch(ctx)
-
 			if err != nil {
 				log.Printf("⚠️ Erro crítico: %v", err)
 				time.Sleep(5 * time.Second)
