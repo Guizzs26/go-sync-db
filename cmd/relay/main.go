@@ -9,30 +9,30 @@ import (
 	"time"
 
 	"github.com/Guizzs26/go-sync-db/internal/broker"
+	"github.com/Guizzs26/go-sync-db/internal/config"
 	"github.com/Guizzs26/go-sync-db/internal/db"
 	"github.com/Guizzs26/go-sync-db/internal/service"
 	"github.com/Guizzs26/go-sync-db/pkg/infra"
 )
 
 func main() {
-	logger := infra.SetupLogger()
+	cfg := config.Load()
+	logger := infra.SetupLogger(cfg)
+	slog.SetDefault(logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	dbURL := getEnv("DATABASE_URL", "postgres://admin:password@localhost:5432/modern_pax_db")
-	mqURL := getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
-
-	postgres, err := db.NewPostgresRepository(ctx, dbURL)
+	postgres, err := db.NewPostgresRepository(ctx, cfg.DatabaseURL, logger)
 	if err != nil {
-		slog.Error("falha fatal no Postgres", "error", err)
+		slog.Error("Fatal error connecting to Postgres", "error", err)
 		os.Exit(1)
 	}
 	defer postgres.Close()
 
-	rabbitmq, err := broker.NewRabbitMQClient(mqURL, logger)
+	rabbitmq, err := broker.NewRabbitMQClient(cfg.RabbitMQURL, logger)
 	if err != nil {
-		slog.Error("falha fatal no RabbitMQ", "error", err)
+		slog.Error("Fatal error connecting to RabbitMQ", "error", err)
 		os.Exit(1)
 	}
 	defer rabbitmq.Close()
@@ -40,28 +40,26 @@ func main() {
 	syncService := service.NewSyncService(postgres, rabbitmq, logger)
 
 	dlqDone := make(chan struct{})
-	go runMaintenance(ctx, postgres, dlqDone)
+	go runMaintenance(ctx, postgres, cfg.MaintenanceInterval, dlqDone)
 
-	slog.Info("🚀 Sentinel Relay Service iniciado", "pid", os.Getpid())
-
-	runMainLoop(ctx, syncService, dlqDone)
+	slog.Info("🚀 Sentinel Relay Service started", "pid", os.Getpid())
+	runMainLoop(ctx, syncService, cfg, dlqDone)
 }
 
-func runMainLoop(ctx context.Context, s *service.SyncService, dlqDone chan struct{}) {
+func runMainLoop(ctx context.Context, s *service.SyncService, cfg *config.Config, dlqDone chan struct{}) {
 	backoff := service.NewBackoff(1*time.Second, 60*time.Second, 2.0)
 
 	for {
 		select {
 		case <-ctx.Done():
-			slog.Info("👋 Encerrando Relay Service de forma graciosa...")
-			<-dlqDone
-			slog.Info("✅ Shutdown concluído")
+			slog.Info("👋 Shutting down main loop...")
+			<-dlqDone // Block until maintenance finishes current task
+			slog.Info("✅ Shutdown complete")
 			return
-
 		default:
-			if err := s.ProcessNextBatch(ctx); err != nil {
+			if err := s.ProcessNextBatch(ctx, cfg.BatchSize); err != nil {
 				wait := backoff.Next()
-				slog.Error("erro crítico no lote",
+				slog.Error("Batch processing error",
 					"attempt", backoff.Attempts(),
 					"retry_in", wait,
 					"error", err,
@@ -74,35 +72,27 @@ func runMainLoop(ctx context.Context, s *service.SyncService, dlqDone chan struc
 					return
 				}
 			}
-
 			backoff.Reset()
-			time.Sleep(1 * time.Second)
+			time.Sleep(cfg.PollInterval)
 		}
 	}
 }
 
-func runMaintenance(ctx context.Context, repo *db.PostgresRepository, done chan struct{}) {
+func runMaintenance(ctx context.Context, repo *db.PostgresRepository, interval time.Duration, done chan struct{}) {
 	defer close(done)
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			slog.Info("🧹 Sweep: Iniciando limpeza da Outbox (Moving to DLQ)")
+			slog.Info("🧹 Sweep: Starting Outbox cleanup (Moving to DLQ)")
 			if err := repo.MoveToDLQ(ctx); err != nil {
-				slog.Error("falha na manutenção da DLQ", "error", err)
+				slog.Error("DLQ maintenance failure", "error", err)
 			}
 		case <-ctx.Done():
-			slog.Info("🛑 Parando goroutine de manutenção")
+			slog.Info("🛑 Stopping maintenance goroutine")
 			return
 		}
 	}
-}
-
-func getEnv(key, fallback string) string {
-	if value, ok := os.LookupEnv(key); ok {
-		return value
-	}
-	return fallback
 }

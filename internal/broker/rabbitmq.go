@@ -11,40 +11,42 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+// RabbitMQClient handles the low-level communication with the message broker
 type RabbitMQClient struct {
 	conn    *amqp.Connection
 	channel *amqp.Channel
 	logger  *slog.Logger
 }
 
+// NewRabbitMQClient initializes a connection and a channel, enabling Publisher Confirms by default
 func NewRabbitMQClient(url string, l *slog.Logger) (*RabbitMQClient, error) {
-	conn, err := amqp.Dial(url)
+	c, err := amqp.Dial(url)
 	if err != nil {
-		return nil, fmt.Errorf("falha ao conectar no RabbitMQ: %w", err)
+		return nil, fmt.Errorf("failed to connect to RabbitMQ: %v", err)
 	}
 
-	ch, err := conn.Channel()
+	ch, err := c.Channel()
 	if err != nil {
-		return nil, fmt.Errorf("falha ao abrir canal: %w", err)
+		return nil, fmt.Errorf("failed to open RabbitMQ channel: %v", err)
 	}
 
 	if err := ch.Confirm(false); err != nil {
-		return nil, fmt.Errorf("falha ao ativar Publisher Confirms: %w", err)
+		return nil, fmt.Errorf("failed to activate Publisher Confirms: %v", err)
 	}
 
-	l.Info("conectado ao RabbitMQ com sucesso", "url", url)
-
+	l.Info("Successfully connected to RabbitMQ", "url", url)
 	return &RabbitMQClient{
-		conn:    conn,
+		conn:    c,
 		channel: ch,
 		logger:  l,
 	}, nil
 }
 
+// Publish sends an entry to the broker and blocks until a confirmation (ACK/NACK) is received
 func (r *RabbitMQClient) Publish(ctx context.Context, routingKey string, entry models.OutboxEntry) error {
 	body, err := json.Marshal(entry)
 	if err != nil {
-		return fmt.Errorf("falha ao serializar entry: %w", err)
+		return fmt.Errorf("failed to serialize entry: %v", err)
 	}
 
 	l := r.logger.With(
@@ -67,29 +69,28 @@ func (r *RabbitMQClient) Publish(ctx context.Context, routingKey string, entry m
 			Body:         body,
 		},
 	)
-
 	if err != nil {
-		l.Error("falha no disparo do publish", "error", err)
-		return fmt.Errorf("erro ao disparar publish: %w", err)
+		l.Error("RabbitMQ returned NACK (persistence failure)")
+		return fmt.Errorf("RabbitMQ NACK for correlation_id: %s", entry.CorrelationID)
 	}
 
 	if !deferred.Wait() {
-		l.Error("RabbitMQ enviou NACK (falha de persistência)")
-		return fmt.Errorf("RabbitMQ enviou NACK para correlation_id: %s", entry.CorrelationID)
+		l.Error("RabbitMQ returned NACK (persistence failure)")
+		return fmt.Errorf("RabbitMQ NACK for correlation_id: %s", entry.CorrelationID)
 	}
 
-	l.Debug("mensagem confirmada pelo broker")
-
+	l.Debug("Message confirmed by broker")
 	return nil
 }
 
+// Close gracefully shuts down the RabbitMQ resources
 func (r *RabbitMQClient) Close() {
 	if r.channel != nil {
-		r.logger.Info("fechando canal do RabbitMQ")
+		r.logger.Info("Closing RabbitMQ channel")
 		r.channel.Close()
 	}
 	if r.conn != nil {
-		r.logger.Info("desconectando do RabbitMQ")
+		r.logger.Info("Disconnecting from RabbitMQ")
 		r.conn.Close()
 	}
 }

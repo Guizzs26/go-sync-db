@@ -3,41 +3,50 @@ package db
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/Guizzs26/go-sync-db/internal/models"
-
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type PostgresRepository struct {
-	pool *pgxpool.Pool
+	pool   *pgxpool.Pool
+	logger *slog.Logger
 }
 
-func NewPostgresRepository(ctx context.Context, connString string) (*PostgresRepository, error) {
+// NewPostgresRepository initializes the connection pool with explicit health checks
+func NewPostgresRepository(ctx context.Context, connString string, logger *slog.Logger) (*PostgresRepository, error) {
 	config, err := pgxpool.ParseConfig(connString)
 	if err != nil {
-		return nil, fmt.Errorf("erro ao configurar pool do postgres: %w", err)
+		return nil, fmt.Errorf("failed to parse postgres config: %v", err)
 	}
 
 	p, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
-		return nil, fmt.Errorf("erro ao criar pool do postgres: %w", err)
+		return nil, fmt.Errorf("failed to create postgres pool: %v", err)
 	}
 
 	if err := p.Ping(ctx); err != nil {
-		return nil, fmt.Errorf("sem resposta do postgres: %w", err)
+		return nil, fmt.Errorf("postgres ping failed: %v", err)
 	}
 
-	return &PostgresRepository{pool: p}, nil
+	return &PostgresRepository{
+		pool:   p,
+		logger: logger,
+	}, nil
 }
 
+// FetchAndClaim picks pending or stale messages and marks them as 'processing' in a single transaction
 func (r *PostgresRepository) FetchAndClaim(ctx context.Context, batchSize int) ([]models.OutboxEntry, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to begin transaction: %v", err)
 	}
 	defer tx.Rollback(ctx)
 
+	// CTE Strategy:
+	// 1. Get new pending messages
+	// 2. Get stale messages that were 'processing' for too long (rescue logic)
 	query := `
         WITH candidates AS (
             (SELECT id, correlation_id, unit_id, table_name, operation, payload, attempts
@@ -51,12 +60,11 @@ func (r *PostgresRepository) FetchAndClaim(ctx context.Context, batchSize int) (
              ORDER BY updated_at ASC LIMIT $1)
             LIMIT $1
         )
-        SELECT * FROM candidates FOR UPDATE SKIP LOCKED
-    `
+        SELECT * FROM candidates FOR UPDATE SKIP LOCKED`
 
 	rows, err := tx.Query(ctx, query, batchSize)
 	if err != nil {
-		return nil, fmt.Errorf("falha ao buscar pendências: %w", err)
+		return nil, fmt.Errorf("failed to query outbox candidates: %v", err)
 	}
 	defer rows.Close()
 
@@ -65,80 +73,59 @@ func (r *PostgresRepository) FetchAndClaim(ctx context.Context, batchSize int) (
 
 	for rows.Next() {
 		var e models.OutboxEntry
-		err := rows.Scan(
-			&e.ID,
-			&e.CorrelationID,
-			&e.UnitID,
-			&e.TableName,
-			&e.Operation,
-			&e.Payload,
-			&e.Attempts,
-		)
+		err := rows.Scan(&e.ID, &e.CorrelationID, &e.UnitID, &e.TableName, &e.Operation, &e.Payload, &e.Attempts)
 		if err != nil {
-			return nil, fmt.Errorf("erro no scan da outbox: %w", err)
+			return nil, fmt.Errorf("failed to scan outbox row: %v", err)
 		}
 		entries = append(entries, e)
 		ids = append(ids, e.ID)
 	}
+
 	if len(ids) == 0 {
 		return nil, nil
 	}
 
+	// Atomic update to prevent other instances from picking the same batch
 	if _, err = tx.Exec(ctx, `
         UPDATE pg_sync_outbox 
         SET status = 'processing',
             attempts = attempts + 1,
             updated_at = NOW()
-        WHERE id = ANY($1)
-    `, ids,
+        WHERE id = ANY($1)`, ids,
 	); err != nil {
-		return nil, fmt.Errorf("erro ao reivindicar mensagens: %w", err)
+		return nil, fmt.Errorf("failed to claim messages: %v", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("erro ao commitar: %w", err)
+		return nil, fmt.Errorf("failed to commit transaction: %v", err)
 	}
 
 	return entries, nil
 }
 
 func (r *PostgresRepository) MarkAsSent(ctx context.Context, id int64) error {
-	query := `
-		UPDATE pg_sync_outbox 
-		SET status = 'sent', updated_at = CURRENT_TIMESTAMP 
-		WHERE id = $1
-	`
-	_, err := r.pool.Exec(ctx, query, id)
-	return err
+	query := `UPDATE pg_sync_outbox SET status = 'sent', updated_at = NOW() WHERE id = $1`
+	if _, err := r.pool.Exec(ctx, query, id); err != nil {
+		return fmt.Errorf("failed to mark as sent (ID: %v): %v", id, err)
+	}
+	return nil
 }
 
 func (r *PostgresRepository) MarkAsError(ctx context.Context, id int64, errLog string) error {
-	query := `
-		UPDATE pg_sync_outbox 
-		SET status = 'error', 
-		    attempts = attempts + 1, 
-		    error_log = $2, 
-		    updated_at = CURRENT_TIMESTAMP 
-		WHERE id = $1
-	`
-	_, err := r.pool.Exec(ctx, query, id, errLog)
-	return err
-}
-
-func (r *PostgresRepository) Close() {
-	r.pool.Close()
+	// Note: attempts are already incremented in FetchAndClaim to prevent infinite loops
+	query := `UPDATE pg_sync_outbox SET status = 'error', error_log = $2, updated_at = NOW() WHERE id = $1`
+	if _, err := r.pool.Exec(ctx, query, id, errLog); err != nil {
+		return fmt.Errorf("failed to mark as error (ID: %v): %v", id, err)
+	}
+	return nil
 }
 
 func (r *PostgresRepository) MarkAsPending(ctx context.Context, id int64, errLog string) error {
-	query := `
-        UPDATE pg_sync_outbox 
-        SET status = 'pending',
-            error_log = $2,
-            updated_at = CURRENT_TIMESTAMP 
-        WHERE id = $1
-    `
-	_, err := r.pool.Exec(ctx, query, id, errLog)
-	return err
+	query := `UPDATE pg_sync_outbox SET status = 'pending', error_log = $2, updated_at = NOW() WHERE id = $1`
+	if _, err := r.pool.Exec(ctx, query, id, errLog); err != nil {
+		return fmt.Errorf("failed to mark as pending (ID: %v): %v", id, err)
+	}
+	return nil
 }
 
 func (r *PostgresRepository) MoveToDLQ(ctx context.Context) error {
@@ -155,8 +142,13 @@ func (r *PostgresRepository) MoveToDLQ(ctx context.Context) error {
         SELECT 
             correlation_id, unit_id, table_name, operation,
             payload, attempts, error_log, NOW()
-        FROM moved
-    `
-	_, err := r.pool.Exec(ctx, query)
-	return err
+        FROM moved`
+	if _, err := r.pool.Exec(ctx, query); err != nil {
+		return fmt.Errorf("failed to move poison pills to DLQ: %v", err)
+	}
+	return nil
+}
+
+func (r *PostgresRepository) Close() {
+	r.pool.Close()
 }
