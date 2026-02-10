@@ -62,22 +62,28 @@ func main() {
 
 	log.Println("🚀 Relay Service iniciado. Monitorando pg_sync_outbox...")
 
+	backoff := service.NewBackoff(1*time.Second, 60*time.Second, 2.0)
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("👋 Encerrando Relay Service de forma graciosa...")
-
+			log.Println("👋 Encerrando...")
 			<-dlqDone
-			log.Println("✅ Shutdown finalizado com sucesso.")
 			return
-
 		default:
 			err := syncService.ProcessNextBatch(ctx)
+
 			if err != nil {
-				log.Printf("⚠️ Erro crítico: %v", err)
-				time.Sleep(5 * time.Second)
-				continue
+				wait := backoff.Next()
+				log.Printf("⚠️ Erro crítico: %v. Retrying in %v", err, wait)
+
+				select {
+				case <-time.After(wait):
+					continue
+				case <-ctx.Done():
+					return
+				}
 			}
+			backoff.Reset()
 
 			time.Sleep(1 * time.Second)
 		}
