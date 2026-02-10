@@ -1,15 +1,67 @@
 services:
-  rabbitmq:
-    image: rabbitmq:4.0-management
-    container_name: sync-broker
-    ports:
-      - "5672:5672"
-      - "15672:15672"
+  postgres-central:
+    image: postgres:16
+    container_name: main-db
+    restart: always
     environment:
-      - RABBITMQ_DEFAULT_USER=guest
-      - RABBITMQ_DEFAULT_PASS=guest
-    healthcheck:
-      test: [ "CMD", "rabbitmq-diagnostics", "check-running" ]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      POSTGRES_USER: test-user
+      POSTGRES_PASSWORD: test-pass
+      POSTGRES_DB: test-db
+    ports:
+      - "5301:5432"
+    volumes:
+      - ./init-postgres.sql:/docker-entrypoint-initdb.d/init-postgres.sql
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - test-network
+
+  rabbitmq:
+    image: rabbitmq:4.0-management-alpine
+    container_name: test-rabbitmq
+    restart: always
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"   
+      - "15672:15672" 
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - test-network
+
+  firebird-unit-1:
+    image: jacobalberty/firebird:2.5-ss
+    container_name: fb-unit-1
+    restart: always
+    environment:
+      ISC_PASSWORD: masterkey
+    ports:
+      - "3051:3050" 
+    volumes:
+      - fb_unit1_data:/firebird/data
+    networks:
+      - test-network
+
+  firebird-unit-2:
+    image: jacobalberty/firebird:2.5-ss
+    container_name: fb-unit-2
+    restart: always
+    environment:
+      ISC_PASSWORD: masterkey
+    ports:
+      - "3052:3050" 
+    volumes:
+      - fb_unit2_data:/firebird/data
+    networks:
+      - test-network
+
+networks:
+  test-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
+  fb_unit1_data:
+  fb_unit2_data:
