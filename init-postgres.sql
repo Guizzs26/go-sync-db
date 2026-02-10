@@ -8,7 +8,7 @@ CREATE TABLE pg_sync_outbox (
     operation CHAR(1) NOT NULL, -- 'I' (Insert), 'U' (Update), 'D' (Delete)
     payload JSONB NOT NULL,
     status VARCHAR(20) DEFAULT 'pending', -- pending, sent, error
-    attempts INT DEFAULT 0,
+    attempts INT DEFAULT 0 CHECK (attempts >= 0),
     error_log TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
@@ -16,6 +16,10 @@ CREATE TABLE pg_sync_outbox (
 
 CREATE INDEX idx_outbox_status_pending ON pg_sync_outbox(status) WHERE status = 'pending';
 CREATE INDEX idx_outbox_created_at ON pg_sync_outbox(created_at);
+
+CREATE INDEX idx_outbox_retry_lookup 
+ON pg_sync_outbox(status, attempts) 
+WHERE status = 'pending' AND attempts < 5;
 
 CREATE TABLE pg_sync_dlq (
     id BIGSERIAL PRIMARY KEY,

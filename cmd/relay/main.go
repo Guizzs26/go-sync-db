@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -11,70 +11,61 @@ import (
 	"github.com/Guizzs26/go-sync-db/internal/broker"
 	"github.com/Guizzs26/go-sync-db/internal/db"
 	"github.com/Guizzs26/go-sync-db/internal/service"
+	"github.com/Guizzs26/go-sync-db/pkg/infra"
 )
 
 func main() {
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		dbURL = "postgres://admin:password@localhost:5432/modern_pax_db"
-	}
+	logger := infra.SetupLogger()
 
-	mqURL := os.Getenv("RABBITMQ_URL")
-	if mqURL == "" {
-		mqURL = "amqp://guest:guest@localhost:5672/"
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	dbURL := getEnv("DATABASE_URL", "postgres://admin:password@localhost:5432/modern_pax_db")
+	mqURL := getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+
 	postgres, err := db.NewPostgresRepository(ctx, dbURL)
 	if err != nil {
-		log.Fatalf("❌ Erro no Postgres: %v", err)
+		slog.Error("falha fatal no Postgres", "error", err)
+		os.Exit(1)
 	}
 	defer postgres.Close()
 
-	rabbitmq, err := broker.NewRabbitMQClient(mqURL)
+	rabbitmq, err := broker.NewRabbitMQClient(mqURL, logger)
 	if err != nil {
-		log.Fatalf("❌ Erro no RabbitMQ: %v", err)
+		slog.Error("falha fatal no RabbitMQ", "error", err)
+		os.Exit(1)
 	}
 	defer rabbitmq.Close()
 
-	syncService := service.NewSyncService(postgres, rabbitmq)
+	syncService := service.NewSyncService(postgres, rabbitmq, logger)
 
 	dlqDone := make(chan struct{})
-	go func() {
-		defer close(dlqDone)
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
+	go runMaintenance(ctx, postgres, dlqDone)
 
-		for {
-			select {
-			case <-ticker.C:
-				log.Println("Sweep: Iniciando limpeza da Outbox (Moving to DLQ)...")
-				if err := postgres.MoveToDLQ(ctx); err != nil {
-					log.Printf("⚠️ Erro na manutenção da DLQ: %v", err)
-				}
-			case <-ctx.Done():
-				log.Println("🛑 Parando goroutine da DLQ...")
-				return
-			}
-		}
-	}()
+	slog.Info("🚀 Sentinel Relay Service iniciado", "pid", os.Getpid())
 
-	log.Println("🚀 Relay Service iniciado. Monitorando pg_sync_outbox...")
+	runMainLoop(ctx, syncService, dlqDone)
+}
 
+func runMainLoop(ctx context.Context, s *service.SyncService, dlqDone chan struct{}) {
 	backoff := service.NewBackoff(1*time.Second, 60*time.Second, 2.0)
+
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("👋 Encerrando...")
+			slog.Info("👋 Encerrando Relay Service de forma graciosa...")
 			<-dlqDone
+			slog.Info("✅ Shutdown concluído")
 			return
-		default:
-			err := syncService.ProcessNextBatch(ctx)
 
-			if err != nil {
+		default:
+			if err := s.ProcessNextBatch(ctx); err != nil {
 				wait := backoff.Next()
-				log.Printf("⚠️ Erro crítico: %v. Retrying in %v", err, wait)
+				slog.Error("erro crítico no lote",
+					"attempt", backoff.Attempts(),
+					"retry_in", wait,
+					"error", err,
+				)
 
 				select {
 				case <-time.After(wait):
@@ -83,9 +74,35 @@ func main() {
 					return
 				}
 			}
-			backoff.Reset()
 
+			backoff.Reset()
 			time.Sleep(1 * time.Second)
 		}
 	}
+}
+
+func runMaintenance(ctx context.Context, repo *db.PostgresRepository, done chan struct{}) {
+	defer close(done)
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			slog.Info("🧹 Sweep: Iniciando limpeza da Outbox (Moving to DLQ)")
+			if err := repo.MoveToDLQ(ctx); err != nil {
+				slog.Error("falha na manutenção da DLQ", "error", err)
+			}
+		case <-ctx.Done():
+			slog.Info("🛑 Parando goroutine de manutenção")
+			return
+		}
+	}
+}
+
+func getEnv(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return fallback
 }

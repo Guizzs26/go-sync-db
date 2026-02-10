@@ -3,7 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 
 	"github.com/Guizzs26/go-sync-db/internal/models"
 )
@@ -22,18 +22,21 @@ type BrokerClient interface {
 type SyncService struct {
 	repo   Repository
 	broker BrokerClient
+	logger *slog.Logger
 }
 
-func NewSyncService(r Repository, b BrokerClient) *SyncService {
+func NewSyncService(r Repository, b BrokerClient, l *slog.Logger) *SyncService {
 	return &SyncService{
 		repo:   r,
 		broker: b,
+		logger: l,
 	}
 }
 
 func (s *SyncService) ProcessNextBatch(ctx context.Context) error {
 	entries, err := s.repo.FetchAndClaim(ctx, 100)
 	if err != nil {
+		s.logger.Error("falha ao buscar pendências no banco", "error", err)
 		return fmt.Errorf("erro ao buscar pendências: %w", err)
 	}
 
@@ -41,7 +44,16 @@ func (s *SyncService) ProcessNextBatch(ctx context.Context) error {
 		return nil
 	}
 
+	s.logger.Info("lote capturado para processamento", "count", len(entries))
 	for _, e := range entries {
+		l := s.logger.With(
+			"correlation_id", e.CorrelationID,
+			"unit_id", e.UnitID,
+			"table", e.TableName,
+		)
+
+		l.Debug("processando mensagem")
+
 		routingKey := fmt.Sprintf("pax.unit.%d.%s.%s",
 			e.UnitID,
 			e.TableName,
@@ -49,13 +61,17 @@ func (s *SyncService) ProcessNextBatch(ctx context.Context) error {
 		)
 
 		if err := s.broker.Publish(ctx, routingKey, e); err != nil {
+			l.Error("falha na publicação no RabbitMQ", "error", err)
 			s.repo.MarkAsPending(ctx, e.ID, err.Error())
 			continue
 		}
 
 		if err := s.repo.MarkAsSent(ctx, e.ID); err != nil {
-			log.Printf("⚠️ Erro MarkAsSent [%s]: %v", e.CorrelationID, err)
+			l.Warn("mensagem enviada mas falhou ao marcar como 'sent'", "error", err)
+		} else {
+			l.Info("sincronização concluída com sucesso")
 		}
 	}
+
 	return nil
 }
