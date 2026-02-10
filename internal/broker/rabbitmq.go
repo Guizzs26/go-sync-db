@@ -46,10 +46,10 @@ func (r *RabbitMQClient) Publish(ctx context.Context, routingKey string, entry m
 		return fmt.Errorf("falha ao serializar entry: %w", err)
 	}
 
-	if err = r.channel.PublishWithContext(
+	deferred, err := r.channel.PublishWithDeferredConfirmWithContext(
 		ctx,
 		"pax.direct",
-		routingKey, // pax.unit.{id}.{table}.{op}
+		routingKey,
 		false,
 		false,
 		amqp.Publishing{
@@ -60,19 +60,16 @@ func (r *RabbitMQClient) Publish(ctx context.Context, routingKey string, entry m
 			DeliveryMode: amqp.Persistent,
 			Body:         body,
 		},
-	); err != nil {
+	)
+	if err != nil {
 		return fmt.Errorf("erro ao disparar publish: %w", err)
 	}
 
-	select {
-	case confirmed := <-r.confirms:
-		if confirmed.Ack {
-			return nil
-		}
+	if !deferred.Wait() {
 		return fmt.Errorf("RabbitMQ enviou NACK para correlation_id: %s", entry.CorrelationID)
-	case <-ctx.Done():
-		return ctx.Err()
 	}
+
+	return nil
 }
 
 func (r *RabbitMQClient) Close() {
