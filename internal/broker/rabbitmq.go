@@ -30,6 +30,18 @@ func NewRabbitMQClient(url string, l *slog.Logger) (*RabbitMQClient, error) {
 		return nil, fmt.Errorf("failed to open RabbitMQ channel: %v", err)
 	}
 
+	if err := ch.ExchangeDeclare(
+		"pax.topic",
+		"topic",
+		true,
+		false,
+		false,
+		false,
+		nil,
+	); err != nil {
+		return nil, fmt.Errorf("failed to declare topic exchange: %v", err)
+	}
+
 	if err := ch.Confirm(false); err != nil {
 		return nil, fmt.Errorf("failed to activate Publisher Confirms: %v", err)
 	}
@@ -56,7 +68,7 @@ func (r *RabbitMQClient) Publish(ctx context.Context, routingKey string, entry m
 
 	deferred, err := r.channel.PublishWithDeferredConfirmWithContext(
 		ctx,
-		"pax.direct",
+		"pax.topic",
 		routingKey,
 		false,
 		false,
@@ -70,8 +82,8 @@ func (r *RabbitMQClient) Publish(ctx context.Context, routingKey string, entry m
 		},
 	)
 	if err != nil {
-		l.Error("RabbitMQ returned NACK (persistence failure)")
-		return fmt.Errorf("RabbitMQ NACK for correlation_id: %s", entry.CorrelationID)
+		l.Error("failed to publish message to exchange", "error", err)
+		return fmt.Errorf("publish call failed: %v", err)
 	}
 
 	if !deferred.Wait() {
