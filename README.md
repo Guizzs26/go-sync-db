@@ -13,6 +13,8 @@ Evitamos o antipadrão de Dual-Write (escrever em dois bancos simultaneamente), 
 
 O fluxo PG -> FB
 
+![Uploading system_design_pg_fb.png…]()
+
 1. Toda operação de escrita no Postgres que exige replicação ocorre dentro de uma transação única. O dado de negócio e o evento de sincronização (na tabela pg_sync_outbox) são salvos juntos. Ou ambos persistem, ou nada acontece.
 
 CREATE TABLE pg_sync_outbox (
