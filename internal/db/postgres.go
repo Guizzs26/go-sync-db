@@ -144,6 +144,25 @@ func (r *PostgresRepository) MarkManyAsPending(ctx context.Context, ids []int64,
 	return err
 }
 
+// ResetStaleMessages returns messages that have been stuck in 'processing' to 'pending'
+// for longer than the defined limit (timeoutMinutes)
+func (r *PostgresRepository) ResetStaleMessages(ctx context.Context, timeoutMinutes int) (int64, error) {
+	query := `
+		UPDATE pg_sync_outbox 
+		SET status = 'pending', 
+		    updated_at = NOW(),
+		    error_log = LEFT(COALESCE(error_log, '') || ' | [Janitor] Stuck recovery', 2000)
+		WHERE status = 'processing' 
+		  AND updated_at < NOW() - ($1 * INTERVAL '1 minute')`
+
+	tag, err := r.pool.Exec(ctx, query, timeoutMinutes)
+	if err != nil {
+		return 0, fmt.Errorf("failed to reset stale messages: %w", err)
+	}
+
+	return tag.RowsAffected(), nil
+}
+
 func (r *PostgresRepository) MoveToDLQ(ctx context.Context) error {
 	query := `
         WITH moved AS (

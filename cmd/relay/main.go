@@ -115,12 +115,21 @@ func runMaintenance(ctx context.Context, repo *db.PostgresRepository, interval t
 	for {
 		select {
 		case <-ticker.C:
-			slog.Info("🧹 Sweep: Starting Outbox cleanup (Moving to DLQ)")
-			if err := repo.MoveToDLQ(ctx); err != nil {
-				slog.Error("DLQ maintenance failure", "error", err)
+			slog.Info("🧹 Janitor: Starting structural health checks")
+
+			affected, err := repo.ResetStaleMessages(ctx, 10)
+			if err != nil {
+				slog.Error("Janitor: Failed to reset stale messages", "error", err)
+			} else if affected > 0 {
+				slog.Warn("Janitor: Rescued stuck messages", "count", affected)
 			}
+
+			if err := repo.MoveToDLQ(ctx); err != nil {
+				slog.Error("Janitor: DLQ maintenance failure", "error", err)
+			}
+
 		case <-ctx.Done():
-			slog.Info("🛑 Stopping maintenance goroutine")
+			slog.Info("🛑 Janitor: Stopping maintenance goroutine")
 			return
 		}
 	}
