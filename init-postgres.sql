@@ -5,21 +5,22 @@ CREATE TABLE pg_sync_outbox (
     correlation_id UUID NOT NULL DEFAULT gen_random_uuid(),
     unit_id INT NOT NULL,
     table_name VARCHAR(50) NOT NULL,
-    operation CHAR(1) NOT NULL, -- 'I' (Insert), 'U' (Update), 'D' (Delete)
+    operation CHAR(1) NOT NULL, 
     payload JSONB NOT NULL,
-    status VARCHAR(20) DEFAULT 'pending', -- pending, sent, error
+    status VARCHAR(20) DEFAULT 'pending', 
     attempts INT DEFAULT 0 CHECK (attempts >= 0),
     error_log TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_outbox_status_pending ON pg_sync_outbox(status) WHERE status = 'pending';
-CREATE INDEX idx_outbox_created_at ON pg_sync_outbox(created_at);
+CREATE INDEX idx_outbox_fetch_main 
+ON pg_sync_outbox (status, created_at, id) 
+WHERE attempts < 5 AND status IN ('pending', 'processing');
 
-CREATE INDEX idx_outbox_retry_lookup 
-ON pg_sync_outbox(status, attempts) 
-WHERE status = 'pending' AND attempts < 5;
+CREATE INDEX idx_outbox_maintenance_stale 
+ON pg_sync_outbox (updated_at) 
+WHERE status = 'processing';
 
 CREATE TABLE pg_sync_dlq (
     id BIGSERIAL PRIMARY KEY,

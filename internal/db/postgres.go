@@ -212,6 +212,10 @@ func (r *PostgresRepository) MoveToDLQ(ctx context.Context) error {
 	return nil
 }
 
+func (r *PostgresRepository) Ping(ctx context.Context) error {
+	return r.pool.Ping(ctx)
+}
+
 func (r *PostgresRepository) Close() {
 	r.pool.Close()
 }

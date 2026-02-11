@@ -10,6 +10,8 @@ import (
 	"github.com/Guizzs26/go-sync-db/internal/models"
 )
 
+const MaxBatchMemoryThresholdMB = 20
+
 // Repository defines the contract for outbox data persistence
 type Repository interface {
 	FetchAndClaim(ctx context.Context, batchSize int) ([]models.OutboxEntry, error)
@@ -41,6 +43,8 @@ func NewSyncService(r Repository, b BrokerClient, l *slog.Logger) *SyncService {
 // ProcessNextBatch captures and sends a batch of messages to the broker
 // It features instant responsiveness to shutdown signals and atomic batch recovery
 func (s *SyncService) ProcessNextBatch(ctx context.Context, batchSize int) error {
+	start := time.Now()
+
 	entries, err := s.repo.FetchAndClaim(ctx, batchSize)
 	if err != nil {
 		return fmt.Errorf("fetch failure: %v", err)
@@ -54,8 +58,14 @@ func (s *SyncService) ProcessNextBatch(ctx context.Context, batchSize int) error
 	for _, e := range entries {
 		batchBytes += e.EstimateBytes()
 	}
-	if batchMB := batchBytes / (1024 * 1024); batchMB > 50 {
-		s.logger.Warn("Heavy batch detected", "size_mb", batchMB, "count", len(entries))
+	batchMB := batchBytes / (1024 * 1024)
+	if batchMB > MaxBatchMemoryThresholdMB {
+		// Log as Warn: This is a signal to reduce BATCH_SIZE in .env (if necessary)
+		s.logger.Warn("Heavy batch detected: memory pressure risk",
+			"size_mb", batchMB,
+			"threshold_mb", MaxBatchMemoryThresholdMB,
+			"count", len(entries),
+		)
 	}
 
 	for i, e := range entries {
@@ -113,6 +123,15 @@ func (s *SyncService) ProcessNextBatch(ctx context.Context, batchSize int) error
 			return fmt.Errorf("db checkpoint failure: %v", err)
 		}
 	}
+
+	defer func() {
+		if len(entries) > 0 {
+			s.logger.Info("Batch cycle telemetry",
+				"count", len(entries),
+				"duration_ms", time.Since(start).Milliseconds(),
+			)
+		}
+	}()
 
 	return nil
 }

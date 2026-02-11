@@ -9,6 +9,11 @@ import (
 	"github.com/joho/godotenv"
 )
 
+const (
+	MinBatchSize = 1
+	MaxBatchSize = 1000
+)
+
 type Config struct {
 	DatabaseURL         string
 	RabbitMQURL         string
@@ -24,12 +29,12 @@ func Load() *Config {
 
 	batchSize := getEnvInt("BATCH_SIZE", 100)
 
-	if batchSize > 1000 {
-		slog.Warn("BATCH_SIZE exceeds safety limit. Clamping to 1000", "requested", batchSize)
-		batchSize = 1000
-	}
-	if batchSize < 1 {
-		batchSize = 1
+	if batchSize > MaxBatchSize {
+		slog.Warn("BATCH_SIZE exceeds safety limit. Clamping to maximum", "requested", batchSize, "limit", MaxBatchSize)
+		batchSize = MaxBatchSize
+	} else if batchSize < MinBatchSize {
+		batchSize = MinBatchSize
+
 	}
 
 	return &Config{
