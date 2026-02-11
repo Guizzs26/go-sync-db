@@ -15,6 +15,7 @@ import (
 	"github.com/Guizzs26/go-sync-db/internal/db"
 	"github.com/Guizzs26/go-sync-db/internal/service"
 	"github.com/Guizzs26/go-sync-db/pkg/infra"
+	"github.com/Guizzs26/go-sync-db/pkg/metrics"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -37,23 +38,31 @@ func main() {
 	}
 	defer postgres.Close()
 
-	// State tracking for Observability
+	// State tracking for Observability & Recovery
 	var currentRabbit *broker.RabbitMQClient
+	maintenanceDone := make(chan struct{})
 
-	// Start Observability Server in a background goroutine
-	// It uses a closure to always check the most recent RabbitMQ instance
+	// Start Background Metrics Collector (Backlog & DLQ Stats)
+	// Runs every 30s to update Prometheus Gauges without hitting sync performance
+	go runMetricsCollector(ctx, postgres)
+
+	// Start Observability Server (Metrics + Health + Readiness)
+	// Uses a closure to always check the most recent RabbitMQ instance status
 	go startObservabilityServer("9090", postgres, func() bool {
 		return currentRabbit != nil && currentRabbit.IsHealthy()
 	})
 
-	// Background Maintenance (Janitor)
-	maintenanceDone := make(chan struct{})
+	// Start Background Maintenance (Janitor)
 	go runMaintenance(ctx, postgres, cfg.MaintenanceInterval, logger, maintenanceDone)
 
-	slog.Info("🚀 Sentinel Relay Service started", "pid", os.Getpid(), "batch_size", cfg.BatchSize)
+	slog.Info("🚀 Sentinel Relay Service started",
+		"pid", os.Getpid(),
+		"batch_size", cfg.BatchSize,
+		"poll_interval", cfg.PollInterval,
+	)
 
-	// Execution Loop
-	// We pass the address of currentRabbit so the loop can update the reference
+	// Enter Main Synchronization Loop
+	// We pass the address of currentRabbit so the loop can update the reference for the health server
 	runMainLoop(ctx, postgres, cfg, logger, &currentRabbit, maintenanceDone)
 }
 
@@ -69,12 +78,12 @@ func runMainLoop(ctx context.Context, repo *db.PostgresRepository, cfg *config.C
 			if *rabbitPtr != nil {
 				(*rabbitPtr).Close()
 			}
-			<-maintenanceDone
-			logger.Info("✅ Sentinel Relay reached safe state")
+			<-maintenanceDone // Wait for janitor to exit safely
+			logger.Info("✅ Sentinel Relay reached safe state. Farewell.")
 			return
 
 		default:
-			// A. Infrastructure Health Check
+			// A. Infrastructure Health Check & Reconnection
 			rabbitmq := *rabbitPtr
 			if rabbitmq == nil || !rabbitmq.IsHealthy() {
 				if rabbitmq != nil {
@@ -96,18 +105,19 @@ func runMainLoop(ctx context.Context, repo *db.PostgresRepository, cfg *config.C
 
 				logger.Info("RabbitMQ link established 🚀")
 				*rabbitPtr = newRabbit
+				metrics.RabbitMQReconnections.Inc() // Track connection instability
 				backoff.Reset()
 				syncService = service.NewSyncService(repo, newRabbit, logger)
 			}
 
-			// B. Batch Processing
+			// B. Batch Processing Execution
 			if err := syncService.ProcessNextBatch(ctx, cfg.BatchSize); err != nil {
 				if errors.Is(err, context.Canceled) {
 					continue
 				}
 
 				wait := backoff.Next()
-				logger.Error("Batch processing error", "retry_in", wait, "error", err)
+				logger.Error("Batch processing failure", "retry_in", wait, "error", err)
 				select {
 				case <-time.After(wait):
 					continue
@@ -116,11 +126,35 @@ func runMainLoop(ctx context.Context, repo *db.PostgresRepository, cfg *config.C
 				}
 			}
 
-			// C. Success Path
+			// C. Success Path: Reset backoff and wait for next poll
 			backoff.Reset()
 			select {
 			case <-time.After(cfg.PollInterval):
+				// Ready for next batch
 			case <-ctx.Done():
+				// Interrupted during wait
+			}
+		}
+	}
+}
+
+// runMetricsCollector updates Prometheus Gauges for backlog and DLQ sizes
+func runMetricsCollector(ctx context.Context, repo *db.PostgresRepository) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// 📊 Update Outbox Backlog Gauge
+			if count, err := repo.GetBacklogCount(ctx); err == nil {
+				metrics.OutboxBacklog.Set(float64(count))
+			}
+			// 📊 Update DLQ Size Gauge
+			if dlqCount, err := repo.GetDLQCount(ctx); err == nil {
+				metrics.DLQSize.Set(float64(dlqCount))
 			}
 		}
 	}
@@ -136,9 +170,13 @@ func runMaintenance(ctx context.Context, repo *db.PostgresRepository, interval t
 		select {
 		case <-ticker.C:
 			logger.Info("🧹 Janitor: Starting structural health checks")
+
+			// Recover messages stuck in 'processing' status
 			if affected, err := repo.ResetStaleMessages(ctx, 10); err == nil && affected > 0 {
 				logger.Warn("Janitor: Rescued stuck messages", "count", affected)
 			}
+
+			// Archive records that exceeded max attempts
 			if err := repo.MoveToDLQ(ctx); err != nil {
 				logger.Error("Janitor: DLQ maintenance failure", "error", err)
 			}
@@ -153,8 +191,10 @@ func runMaintenance(ctx context.Context, repo *db.PostgresRepository, interval t
 func startObservabilityServer(port string, repo *db.PostgresRepository, rabbitHealthy func() bool) {
 	mux := http.NewServeMux()
 
+	// Prometheus Metrics Endpoint
 	mux.Handle("/metrics", promhttp.Handler())
 
+	// Liveness Probe: Process is alive and DB is reachable
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
@@ -166,6 +206,7 @@ func startObservabilityServer(port string, repo *db.PostgresRepository, rabbitHe
 		w.Write([]byte("ALIVE"))
 	})
 
+	// Readiness Probe: External dependencies (Broker) are ready
 	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
 		if rabbitHealthy() {
 			w.WriteHeader(http.StatusOK)

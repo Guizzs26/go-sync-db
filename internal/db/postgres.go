@@ -213,9 +213,44 @@ func (r *PostgresRepository) MoveToDLQ(ctx context.Context) error {
 }
 
 func (r *PostgresRepository) Ping(ctx context.Context) error {
-	return r.pool.Ping(ctx)
+	opCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	return r.pool.Ping(opCtx)
 }
 
 func (r *PostgresRepository) Close() {
 	r.pool.Close()
+}
+
+// GetBacklogCount returns the number of messages waiting to be processed
+func (r *PostgresRepository) GetBacklogCount(ctx context.Context) (int64, error) {
+	opCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	var count int64
+	query := `SELECT COUNT(*) FROM pg_sync_outbox WHERE status IN ('pending', 'processing')`
+
+	err := r.pool.QueryRow(opCtx, query).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get backlog count: %w", err)
+	}
+
+	return count, nil
+}
+
+// GetDLQCount returns the number of messages in the Dead Letter Queue
+func (r *PostgresRepository) GetDLQCount(ctx context.Context) (int64, error) {
+	opCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	var count int64
+	query := `SELECT COUNT(*) FROM pg_sync_dlq`
+
+	err := r.pool.QueryRow(opCtx, query).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get DLQ count: %w", err)
+	}
+
+	return count, nil
 }

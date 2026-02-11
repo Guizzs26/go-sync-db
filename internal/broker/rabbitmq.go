@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Guizzs26/go-sync-db/internal/models"
+	"github.com/Guizzs26/go-sync-db/pkg/metrics"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -72,6 +73,8 @@ func NewRabbitMQClient(url string, l *slog.Logger) (*RabbitMQClient, error) {
 	}
 
 	client.healthy.Store(true)
+	metrics.HealthStatus.Set(1)
+
 	client.conn.NotifyClose(client.connClosed)
 	client.channel.NotifyClose(client.chanClosed)
 
@@ -79,15 +82,18 @@ func NewRabbitMQClient(url string, l *slog.Logger) (*RabbitMQClient, error) {
 		select {
 		case err := <-client.connClosed:
 			client.healthy.Store(false)
+			// System is unhealthy
+			metrics.HealthStatus.Set(0)
 			l.Warn("RabbitMQ connection closed", "error", err)
 		case err := <-client.chanClosed:
 			client.healthy.Store(false)
+			// System is unhealthy
+			metrics.HealthStatus.Set(0)
 			l.Warn("RabbitMQ channel closed", "error", err)
 		case <-client.ctx.Done():
 			return
 		}
 	}()
-
 	l.Info("Successfully connected to RabbitMQ and monitors established", "url", url)
 	return client, nil
 }
