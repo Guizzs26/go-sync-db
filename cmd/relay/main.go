@@ -68,7 +68,7 @@ func main() {
 
 // runMainLoop handles the synchronization lifecycle and infrastructure resilience
 func runMainLoop(ctx context.Context, repo *db.PostgresRepository, cfg *config.Config, logger *slog.Logger, rabbitPtr **broker.RabbitMQClient, maintenanceDone chan struct{}) {
-	backoff := service.NewBackoff(1*time.Second, 60*time.Second, 2.0)
+	backoff := infra.NewBackoff(1*time.Second, 60*time.Second, 2.0)
 	var syncService *service.SyncService
 
 	for {

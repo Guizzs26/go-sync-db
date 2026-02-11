@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 )
 
@@ -23,11 +24,13 @@ func NewFirebirdRepository(connString string, logger *slog.Logger) (*FirebirdRep
 	}
 
 	// Connection pool settings optimized for legacy systems
-	db.SetMaxOpenConns(2)
+	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	db.SetConnMaxLifetime(time.Hour)
+	db.SetConnMaxLifetime(30 * time.Minute)
+	db.SetConnMaxIdleTime(10 * time.Minute)
 
 	if err := db.Ping(); err != nil {
+		db.Close()
 		return nil, fmt.Errorf("firebird ping failed: %v", err)
 	}
 
@@ -83,8 +86,15 @@ func (r *FirebirdRepository) IsProcessed(ctx context.Context, correlationID stri
 // MarkAsProcessed records the correlation_id in the SYNC_CONTROL table
 func (r *FirebirdRepository) MarkAsProcessed(ctx context.Context, tx *sql.Tx, correlationID string) error {
 	query := `INSERT INTO SYNC_CONTROL (CORRELATION_ID) VALUES (?)`
+
 	_, err := tx.ExecContext(ctx, query, correlationID)
 	if err != nil {
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, "violation") || strings.Contains(msg, "unique") || strings.Contains(msg, "primary") {
+			r.logger.Warn("Idempotency race detected: correlation_id already exists in DB", "id", correlationID)
+			return nil
+		}
+
 		return fmt.Errorf("failed to mark message as processed: %v", err)
 	}
 	return nil
