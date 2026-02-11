@@ -18,3 +18,7 @@ type OutboxEntry struct {
 	Payload       json.RawMessage `db:"payload"`
 	Attempts      int             `db:"attempts"`
 }
+
+func (e *OutboxEntry) EstimateBytes() int {
+	return 24 + len(e.TableName) + len(e.Payload) + len(e.CorrelationID)
+}

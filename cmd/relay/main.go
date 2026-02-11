@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -26,20 +27,21 @@ func main() {
 
 	postgres, err := db.NewPostgresRepository(ctx, cfg.DatabaseURL, logger)
 	if err != nil {
-		slog.Error("Fatal error connecting to Postgres", "error", err)
+		slog.Error("Fatal: failed to connect to Postgres", "error", err)
 		os.Exit(1)
 	}
 	defer postgres.Close()
 
-	dlqDone := make(chan struct{})
-	go runMaintenance(ctx, postgres, cfg.MaintenanceInterval, dlqDone)
+	maintenanceDone := make(chan struct{})
+	go runMaintenance(ctx, postgres, cfg.MaintenanceInterval, logger, maintenanceDone)
 
-	slog.Info("🚀 Sentinel Relay Service started", "pid", os.Getpid())
+	slog.Info("🚀 Sentinel Relay Service started", "pid", os.Getpid(), "batch_size", cfg.BatchSize)
 
-	runMainLoop(ctx, postgres, cfg, dlqDone)
+	runMainLoop(ctx, postgres, cfg, logger, maintenanceDone)
 }
 
-func runMainLoop(ctx context.Context, repo *db.PostgresRepository, cfg *config.Config, dlqDone chan struct{}) {
+// runMainLoop handles the synchronization lifecycle and infrastructure resilience
+func runMainLoop(ctx context.Context, repo *db.PostgresRepository, cfg *config.Config, logger *slog.Logger, maintenanceDone chan struct{}) {
 	backoff := service.NewBackoff(1*time.Second, 60*time.Second, 2.0)
 	var rabbitmq *broker.RabbitMQClient
 	var syncService *service.SyncService
@@ -47,90 +49,100 @@ func runMainLoop(ctx context.Context, repo *db.PostgresRepository, cfg *config.C
 	for {
 		select {
 		case <-ctx.Done():
-			slog.Info("👋 Shutting down main loop...")
+			logger.Info("👋 Graceful shutdown initiated: stopping main loop")
 			if rabbitmq != nil {
 				rabbitmq.Close()
 			}
-			<-dlqDone // Espera a limpeza terminar
-			slog.Info("✅ Shutdown complete")
+			<-maintenanceDone // Wait for janitor to finish its last cycle
+			logger.Info("✅ Sentinel Relay reached safe state. Farewell.")
 			return
+
 		default:
-			// 1. Lifecycle: Garante que o Broker está operante
+			// A. Infrastructure Health Check
 			if rabbitmq == nil || !rabbitmq.IsHealthy() {
 				if rabbitmq != nil {
 					rabbitmq.Close()
 				}
 
-				// Tentativa de conexão (incluindo a primeira do boot)
-				newRabbit, err := broker.NewRabbitMQClient(cfg.RabbitMQURL, slog.Default())
+				logger.Info("Attempting to establish RabbitMQ link...")
+				newRabbit, err := broker.NewRabbitMQClient(cfg.RabbitMQURL, logger)
 				if err != nil {
 					wait := backoff.Next()
-					slog.Error("RabbitMQ link failure, retrying", "wait", wait, "error", err)
+					logger.Error("RabbitMQ link failure, backing off", "wait", wait, "error", err)
 
 					select {
 					case <-time.After(wait):
-						continue // Tenta novamente após o backoff
+						continue
 					case <-ctx.Done():
 						return
 					}
 				}
 
-				slog.Info("RabbitMQ link established 🚀")
+				logger.Info("RabbitMQ link established 🚀")
 				rabbitmq = newRabbit
 				backoff.Reset()
-				// Recria o serviço para injetar o novo cliente saudável
-				syncService = service.NewSyncService(repo, rabbitmq, slog.Default())
+				syncService = service.NewSyncService(repo, rabbitmq, logger)
 			}
 
-			// Execution: Processa o lote
+			// B. Batch Processing Execution
 			if err := syncService.ProcessNextBatch(ctx, cfg.BatchSize); err != nil {
+				// We don't backoff if the context was cancelled (expected shutdown)
+				if errors.Is(err, context.Canceled) {
+					continue
+				}
+
 				wait := backoff.Next()
-				slog.Error("Batch processing error", "retry_in", wait, "error", err)
+				logger.Error("Batch processing error", "retry_in", wait, "error", err)
 
 				select {
 				case <-time.After(wait):
-					continue // Mantém o backoff se falhar
+					continue
 				case <-ctx.Done():
 					return
 				}
 			}
 
-			// 4. Sucesso: Reseta backoff e aguarda próximo ciclo (PollInterval)
+			// C. Success Path: Reset backoff and wait for next poll interval
 			backoff.Reset()
 
 			select {
 			case <-time.After(cfg.PollInterval):
-				continue
+				// Ready for next cycle
 			case <-ctx.Done():
-				return
+				// Interrupted during wait
 			}
 		}
 	}
 }
 
-func runMaintenance(ctx context.Context, repo *db.PostgresRepository, interval time.Duration, done chan struct{}) {
+// runMaintenance manages stale messages and moves poison pills to the DLQ
+func runMaintenance(ctx context.Context, repo *db.PostgresRepository, interval time.Duration, logger *slog.Logger, done chan struct{}) {
 	defer close(done)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	logger.Debug("Janitor: Maintenance worker is online")
+
 	for {
 		select {
 		case <-ticker.C:
-			slog.Info("🧹 Janitor: Starting structural health checks")
+			logger.Info("🧹 Janitor: Starting structural health checks")
 
+			// Recover messages stuck in 'processing' status
 			affected, err := repo.ResetStaleMessages(ctx, 10)
 			if err != nil {
-				slog.Error("Janitor: Failed to reset stale messages", "error", err)
+				logger.Error("Janitor: Failed to reset stale messages", "error", err)
 			} else if affected > 0 {
-				slog.Warn("Janitor: Rescued stuck messages", "count", affected)
+				logger.Warn("Janitor: Rescued stuck messages", "count", affected)
 			}
 
+			// Move records that exceeded max attempts to the Dead Letter Queue
 			if err := repo.MoveToDLQ(ctx); err != nil {
-				slog.Error("Janitor: DLQ maintenance failure", "error", err)
+				logger.Error("Janitor: DLQ maintenance failure", "error", err)
 			}
 
 		case <-ctx.Done():
-			slog.Info("🛑 Janitor: Stopping maintenance goroutine")
+			logger.Info("🛑 Janitor: Stopping maintenance goroutine")
 			return
 		}
 	}

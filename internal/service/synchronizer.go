@@ -15,7 +15,6 @@ type Repository interface {
 	FetchAndClaim(ctx context.Context, batchSize int) ([]models.OutboxEntry, error)
 	MarkAsSent(ctx context.Context, id int64) error
 	MarkAsError(ctx context.Context, id int64, errLog string) error
-	MarkAsPending(ctx context.Context, id int64, errLog string) error
 	MarkManyAsPending(ctx context.Context, ids []int64, note string, strategy models.RevertStrategy) error
 }
 
@@ -50,56 +49,66 @@ func (s *SyncService) ProcessNextBatch(ctx context.Context, batchSize int) error
 		return nil
 	}
 
+	// Monitor batch weight to prevent OOM
+	var batchBytes int
+	for _, e := range entries {
+		batchBytes += e.EstimateBytes()
+	}
+	if batchMB := batchBytes / (1024 * 1024); batchMB > 50 {
+		s.logger.Warn("Heavy batch detected", "size_mb", batchMB, "count", len(entries))
+	}
+
 	for i, e := range entries {
-		// Monitor shutdown signals between messages for instant responsiveness
+		// Instant responsiveness to shutdown signals
 		select {
 		case <-ctx.Done():
-			s.logger.Warn("Shutdown signal received. Reverting remaining messages in batch.")
+			s.logger.Warn("Shutdown signal received. Reverting remaining messages.")
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
 			remainingIDs := s.extractRemainingIDs(entries, i)
 			_ = s.repo.MarkManyAsPending(cleanupCtx, remainingIDs, "graceful_shutdown", models.StrategyInfraFailure)
+			cancel()
 			return ctx.Err()
 		default:
 		}
 
 		l := s.logger.With("correlation_id", e.CorrelationID)
 
-		// Validate metadata before any network I/O
-		// Prevents "Log Injection" and routing key corruption in the broker
-		tableName := strings.ToUpper(strings.TrimSpace(e.TableName))
-		_, allowed := models.TableRegistry[tableName]
+		// Whitelist validation
+		// Normalizes table name and checks against the Registry
+		cleanTable := strings.ToLower(strings.TrimSpace(e.TableName))
+		_, allowed := models.TableRegistry[strings.ToUpper(cleanTable)]
 
 		if !allowed || !isValidOperation(e.Operation) {
-			l.Error("Security Trigger: invalid metadata detected. Moving to error state.")
-			// Erro de metadados é fatal: não reverte, marca como erro definitivo.
+			l.Error("Security Trigger: invalid metadata. Moving to error state.", "table", e.TableName)
 			_ = s.repo.MarkAsError(ctx, e.ID, "security_violation: invalid table or operation")
 			continue
 		}
 
-		routingKey := fmt.Sprintf("pax.unit.%d.%s.%s", e.UnitID, e.TableName, e.Operation)
+		// Secure Routing Key construction using sanitized data
+		routingKey := fmt.Sprintf("pax.unit.%d.%s.%s", e.UnitID, cleanTable, e.Operation)
 
-		// Publish to Broker
+		// Broker Publication (Infra Failure Path)
 		if err := s.broker.Publish(ctx, routingKey, e); err != nil {
 			l.Error("publish failed, aborting batch", "error", err)
+
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
 			remainingIDs := s.extractRemainingIDs(entries, i)
+			// Refund attempt (attempts-1) since the broker is down
 			_ = s.repo.MarkManyAsPending(cleanupCtx, remainingIDs, "broker_offline", models.StrategyInfraFailure)
+			cancel()
 			return fmt.Errorf("broker failure: %v", err)
 		}
 
-		// Final DB CHECKPOINT
+		// Final DB Checkpoint (Business Failure Path)
 		if err := s.repo.MarkAsSent(ctx, e.ID); err != nil {
 			l.Error("message sent but failed to update status in DB", "error", err)
 
-			// If the bank failed here, the 'e.ID' is already in the broker (imminent duplication)
-			// We try to save the REST of the batch (i+1 onwards)
 			if i+1 < len(entries) {
 				cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
 				remainingIDs := s.extractRemainingIDs(entries, i+1)
+				// Keep attempt count to avoid infinite duplication loops on data errors
 				_ = s.repo.MarkManyAsPending(cleanupCtx, remainingIDs, "db_checkpoint_failure", models.StrategyBusinessFailure)
+				cancel()
 			}
 			return fmt.Errorf("db checkpoint failure: %v", err)
 		}
