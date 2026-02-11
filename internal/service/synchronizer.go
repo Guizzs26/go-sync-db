@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/Guizzs26/go-sync-db/internal/models"
@@ -50,34 +51,45 @@ func (s *SyncService) ProcessNextBatch(ctx context.Context, batchSize int) error
 	}
 
 	for i, e := range entries {
+		// Monitor shutdown signals between messages for instant responsiveness
 		select {
 		case <-ctx.Done():
 			s.logger.Warn("Shutdown signal received. Reverting remaining messages in batch.")
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-
 			remainingIDs := s.extractRemainingIDs(entries, i)
 			_ = s.repo.MarkManyAsPending(cleanupCtx, remainingIDs, "graceful_shutdown", models.StrategyInfraFailure)
-
 			return ctx.Err()
 		default:
 		}
 
 		l := s.logger.With("correlation_id", e.CorrelationID)
+
+		// Validate metadata before any network I/O
+		// Prevents "Log Injection" and routing key corruption in the broker
+		tableName := strings.ToUpper(strings.TrimSpace(e.TableName))
+		_, allowed := models.TableRegistry[tableName]
+
+		if !allowed || !isValidOperation(e.Operation) {
+			l.Error("Security Trigger: invalid metadata detected. Moving to error state.")
+			// Erro de metadados é fatal: não reverte, marca como erro definitivo.
+			_ = s.repo.MarkAsError(ctx, e.ID, "security_violation: invalid table or operation")
+			continue
+		}
+
 		routingKey := fmt.Sprintf("pax.unit.%d.%s.%s", e.UnitID, e.TableName, e.Operation)
 
+		// Publish to Broker
 		if err := s.broker.Publish(ctx, routingKey, e); err != nil {
 			l.Error("publish failed, aborting batch", "error", err)
-
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			remainingIDs := s.extractRemainingIDs(entries, i)
 			_ = s.repo.MarkManyAsPending(cleanupCtx, remainingIDs, "broker_offline", models.StrategyInfraFailure)
-
 			return fmt.Errorf("broker failure: %v", err)
 		}
 
-		// DB CHECKPOINT
+		// Final DB CHECKPOINT
 		if err := s.repo.MarkAsSent(ctx, e.ID); err != nil {
 			l.Error("message sent but failed to update status in DB", "error", err)
 
@@ -86,7 +98,6 @@ func (s *SyncService) ProcessNextBatch(ctx context.Context, batchSize int) error
 			if i+1 < len(entries) {
 				cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
-
 				remainingIDs := s.extractRemainingIDs(entries, i+1)
 				_ = s.repo.MarkManyAsPending(cleanupCtx, remainingIDs, "db_checkpoint_failure", models.StrategyBusinessFailure)
 			}
@@ -103,4 +114,8 @@ func (s *SyncService) extractRemainingIDs(entries []models.OutboxEntry, start in
 		ids = append(ids, entries[i].ID)
 	}
 	return ids
+}
+
+func isValidOperation(op string) bool {
+	return op == "I" || op == "U" || op == "D"
 }
