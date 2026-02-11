@@ -1,4 +1,3 @@
-# Sentinel: Firebird Multi-Unit Provisioning Script (Safe Version)
 $Containers = @("fb-unit-1", "fb-unit-2")
 $SQLSource = "./init-firebird.sql"
 $DBPath = "/firebird/data/pax.fdb"

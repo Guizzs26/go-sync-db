@@ -15,8 +15,10 @@ const (
 )
 
 type Config struct {
-	DatabaseURL         string
+	PostgresURL         string // (Relay)
+	FirebirdURL         string // (Consumer)
 	RabbitMQURL         string
+	UnitID              int
 	LogLevel            string
 	LogFormat           string
 	BatchSize           int
@@ -28,18 +30,18 @@ func Load() *Config {
 	_ = godotenv.Load()
 
 	batchSize := getEnvInt("BATCH_SIZE", 100)
-
 	if batchSize > MaxBatchSize {
 		slog.Warn("BATCH_SIZE exceeds safety limit. Clamping to maximum", "requested", batchSize, "limit", MaxBatchSize)
 		batchSize = MaxBatchSize
 	} else if batchSize < MinBatchSize {
 		batchSize = MinBatchSize
-
 	}
 
 	return &Config{
-		DatabaseURL:         getEnv("DATABASE_URL", "postgres://admin:password@localhost:5432/modern_pax_db"),
+		PostgresURL:         getEnv("POSTGRES_URL", getEnv("DATABASE_URL", "postgres://test-user:test-pass@localhost:5301/test-db?sslmode=disable")),
+		FirebirdURL:         getEnv("FIREBIRD_URL", "SYSDBA:masterkey@localhost:3051/firebird/data/pax.fdb"),
 		RabbitMQURL:         getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"),
+		UnitID:              getEnvInt("UNIT_ID", 1),
 		LogLevel:            getEnv("LOG_LEVEL", "INFO"),
 		LogFormat:           getEnv("LOG_FORMAT", "TEXT"),
 		BatchSize:           batchSize,

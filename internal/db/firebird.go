@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+
+	_ "github.com/nakagami/firebirdsql"
 )
 
 // FirebirdRepository handles data infrastructure at the branch level

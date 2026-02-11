@@ -57,7 +57,7 @@ CREATE TABLE contacts (
 );
 
 CREATE TABLE addresses (
-    id SERIAL PRIMARY KEY,
+    id SERIAL PRIMARY KE,
     customer_id INT REFERENCES customers(id) ON DELETE CASCADE,
     fb_id INT,
     street VARCHAR(150) NOT NULL,

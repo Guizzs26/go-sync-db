@@ -31,7 +31,7 @@ func main() {
 	defer stop()
 
 	// Database connection (Postgres Source)
-	postgres, err := db.NewPostgresRepository(ctx, cfg.DatabaseURL, logger)
+	postgres, err := db.NewPostgresRepository(ctx, cfg.PostgresURL, logger)
 	if err != nil {
 		slog.Error("Fatal: failed to connect to Postgres", "error", err)
 		os.Exit(1)

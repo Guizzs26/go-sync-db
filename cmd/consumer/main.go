@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -25,16 +24,7 @@ func main() {
 	logger := infra.SetupLogger(cfg)
 	slog.SetDefault(logger)
 
-	unitIDStr := os.Getenv("UNIT_ID")
-	if unitIDStr == "" {
-		logger.Error("CRITICAL: UNIT_ID environment variable is missing")
-		os.Exit(1)
-	}
-	unitID, err := strconv.Atoi(unitIDStr)
-	if err != nil {
-		logger.Error("CRITICAL: UNIT_ID must be an integer", "value", unitIDStr)
-		os.Exit(1)
-	}
+	unitID := cfg.UnitID
 
 	// Graceful Shutdown Context
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -46,7 +36,7 @@ func main() {
 	)
 
 	// Initialize Firebird Infrastructure
-	repo, err := db.NewFirebirdRepository(cfg.DatabaseURL, logger)
+	repo, err := db.NewFirebirdRepository(cfg.FirebirdURL, logger)
 	if err != nil {
 		logger.Error("CRITICAL: Firebird connection failed", "error", err)
 		os.Exit(1)
