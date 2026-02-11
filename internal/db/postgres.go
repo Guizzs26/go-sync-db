@@ -62,7 +62,8 @@ func (r *PostgresRepository) FetchAndClaim(ctx context.Context, batchSize int) (
 			)
 			ORDER BY 
 				CASE WHEN status = 'pending' THEN 0 ELSE 1 END,
-				created_at ASC
+				created_at ASC,
+				id ASC 
 			LIMIT $1
 			FOR UPDATE SKIP LOCKED
 		)
@@ -131,16 +132,17 @@ func (r *PostgresRepository) MarkAsPending(ctx context.Context, id int64, errLog
 	return nil
 }
 
-func (r *PostgresRepository) MarkManyAsPending(ctx context.Context, ids []int64, reason string) error {
+func (r *PostgresRepository) MarkManyAsPending(ctx context.Context, ids []int64, note string, strategy models.RevertStrategy) error {
 	query := `
-        UPDATE pg_sync_outbox 
-        SET status = 'pending', 
-            attempts = attempts + 1, 
-            error_log = $1, 
-            updated_at = NOW() 
-        WHERE id = ANY($2)`
+		UPDATE pg_sync_outbox 
+		SET status = 'pending',
+		    -- Estorno condicional com proteção para nunca ficar negativo (GREATEST)
+		    attempts = CASE WHEN $1 = TRUE THEN GREATEST(attempts - 1, 0) ELSE attempts END,
+		    updated_at = NOW(),
+		    error_log = COALESCE(error_log, '') || $2
+		WHERE id = ANY($3)`
 
-	_, err := r.pool.Exec(ctx, query, "Batch Aborted: "+reason, ids)
+	_, err := r.pool.Exec(ctx, query, strategy, " | "+note, ids)
 	return err
 }
 
@@ -163,13 +165,25 @@ func (r *PostgresRepository) ResetStaleMessages(ctx context.Context, timeoutMinu
 	return tag.RowsAffected(), nil
 }
 
+// MoveToDLQ migrates "poison pills" to the DLQ table after max retries
 func (r *PostgresRepository) MoveToDLQ(ctx context.Context) error {
 	query := `
-        WITH moved AS (
-            DELETE FROM pg_sync_outbox
+        WITH poison_pills AS (
+            -- Phase 1: Identify stale failed records
+            SELECT id FROM pg_sync_outbox
             WHERE attempts >= 5
+              AND status IN ('pending', 'error')            -- Avoids race with 'processing' workers
+              AND updated_at < NOW() - INTERVAL '10 minutes' -- Safety buffer for transient lags
+            FOR UPDATE SKIP LOCKED                         -- Prevents blocking/waiting for active locks
+            LIMIT 100
+        ),
+        deleted AS (
+            -- Phase 2: Atomic removal to ensure data consistency
+            DELETE FROM pg_sync_outbox
+            WHERE id IN (SELECT id FROM poison_pills)
             RETURNING *
         )
+        -- Phase 3: Archive for manual auditing
         INSERT INTO pg_sync_dlq (
             correlation_id, unit_id, table_name, operation, 
             payload, attempts, error_log, failed_at
@@ -177,9 +191,26 @@ func (r *PostgresRepository) MoveToDLQ(ctx context.Context) error {
         SELECT 
             correlation_id, unit_id, table_name, operation,
             payload, attempts, error_log, NOW()
-        FROM moved`
-	if _, err := r.pool.Exec(ctx, query); err != nil {
-		return fmt.Errorf("failed to move poison pills to DLQ: %v", err)
+        FROM deleted
+        RETURNING correlation_id;`
+
+	rows, err := r.pool.Query(ctx, query)
+	if err != nil {
+		return fmt.Errorf("DLQ migration failed: %w", err)
+	}
+	defer rows.Close()
+
+	var count int
+	for rows.Next() {
+		var cid string
+		if err := rows.Scan(&cid); err == nil {
+			count++
+			r.logger.Warn("Poison pill archived", "correlation_id", cid)
+		}
+	}
+
+	if count > 0 {
+		r.logger.Info("Maintenance: DLQ cycle finished", "moved", count)
 	}
 	return nil
 }

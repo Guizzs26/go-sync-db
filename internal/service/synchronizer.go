@@ -15,7 +15,7 @@ type Repository interface {
 	MarkAsSent(ctx context.Context, id int64) error
 	MarkAsError(ctx context.Context, id int64, errLog string) error
 	MarkAsPending(ctx context.Context, id int64, errLog string) error
-	MarkManyAsPending(ctx context.Context, ids []int64, reason string) error
+	MarkManyAsPending(ctx context.Context, ids []int64, note string, strategy models.RevertStrategy) error
 }
 
 // BrokerClient defines the contract for message publishing
@@ -54,11 +54,11 @@ func (s *SyncService) ProcessNextBatch(ctx context.Context, batchSize int) error
 		case <-ctx.Done():
 			s.logger.Warn("Shutdown signal received. Reverting remaining messages in batch.")
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
 			remainingIDs := s.extractRemainingIDs(entries, i)
-			_ = s.repo.MarkManyAsPending(cleanupCtx, remainingIDs, "graceful_shutdown_interruption")
+			_ = s.repo.MarkManyAsPending(cleanupCtx, remainingIDs, "graceful_shutdown", models.StrategyInfraFailure)
 
-			cancel()
 			return ctx.Err()
 		default:
 		}
@@ -70,10 +70,10 @@ func (s *SyncService) ProcessNextBatch(ctx context.Context, batchSize int) error
 			l.Error("publish failed, aborting batch", "error", err)
 
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 			remainingIDs := s.extractRemainingIDs(entries, i)
-			_ = s.repo.MarkManyAsPending(cleanupCtx, remainingIDs, "broker_publish_failure")
+			_ = s.repo.MarkManyAsPending(cleanupCtx, remainingIDs, "broker_offline", models.StrategyInfraFailure)
 
-			cancel()
 			return fmt.Errorf("broker failure: %v", err)
 		}
 
@@ -85,9 +85,10 @@ func (s *SyncService) ProcessNextBatch(ctx context.Context, batchSize int) error
 			// We try to save the REST of the batch (i+1 onwards)
 			if i+1 < len(entries) {
 				cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+
 				remainingIDs := s.extractRemainingIDs(entries, i+1)
-				_ = s.repo.MarkManyAsPending(cleanupCtx, remainingIDs, "db_status_update_failure")
-				cancel()
+				_ = s.repo.MarkManyAsPending(cleanupCtx, remainingIDs, "db_checkpoint_failure", models.StrategyBusinessFailure)
 			}
 			return fmt.Errorf("db checkpoint failure: %v", err)
 		}
