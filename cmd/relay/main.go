@@ -19,6 +19,7 @@ func main() {
 	cfg := config.Load()
 	logger := infra.SetupLogger(cfg)
 	slog.SetDefault(logger)
+	defer infra.CloseLogger()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
