@@ -254,3 +254,18 @@ func (r *PostgresRepository) GetDLQCount(ctx context.Context) (int64, error) {
 
 	return count, nil
 }
+
+func (r *PostgresRepository) MarkAsErrorByCorrelationID(ctx context.Context, correlationID string, errLog string) error {
+	opCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	query := `
+		UPDATE pg_sync_outbox 
+		SET status = 'error', 
+		    error_log = LEFT(COALESCE(error_log, '') || ' | [Feedback] ' || $2, 2000), 
+		    updated_at = NOW() 
+		WHERE correlation_id = $1`
+
+	_, err := r.pool.Exec(opCtx, query, correlationID, errLog)
+	return err
+}

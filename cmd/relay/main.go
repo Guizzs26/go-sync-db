@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -70,6 +71,7 @@ func main() {
 func runMainLoop(ctx context.Context, repo *db.PostgresRepository, cfg *config.Config, logger *slog.Logger, rabbitPtr **broker.RabbitMQClient, maintenanceDone chan struct{}) {
 	backoff := infra.NewBackoff(1*time.Second, 60*time.Second, 2.0)
 	var syncService *service.SyncService
+	var feedbackService *service.FeedbackService
 
 	for {
 		select {
@@ -107,7 +109,18 @@ func runMainLoop(ctx context.Context, repo *db.PostgresRepository, cfg *config.C
 				*rabbitPtr = newRabbit
 				metrics.RabbitMQReconnections.Inc() // Track connection instability
 				backoff.Reset()
+
 				syncService = service.NewSyncService(repo, newRabbit, logger)
+				feedbackService = service.NewFeedbackService(repo, logger)
+
+				// Start Feedback Loop: Listen to dead-letter queues
+				// For now listening to Unit 1, can be expanded to a list of units from config
+				errorQueue := fmt.Sprintf("pax.queue.unit.%d.dead", cfg.UnitID)
+				if err := newRabbit.Consume(ctx, errorQueue, feedbackService.HandleDeadLetter); err != nil {
+					logger.Error("Feedback: failed to start error listener", "queue", errorQueue, "error", err)
+				} else {
+					logger.Info("Feedback: monitoring unit error queue", "queue", errorQueue)
+				}
 			}
 
 			// B. Batch Processing Execution

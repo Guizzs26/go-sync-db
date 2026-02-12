@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"strings"
 	"time"
 
@@ -81,7 +82,10 @@ func (h *SyncHandler) ProcessMessage(ctx context.Context, entry models.OutboxEnt
 	cancel()
 
 	if err != nil {
-		return fmt.Errorf("idempotency check failed: %v", err)
+		if h.isNetworkError(err) {
+			return fmt.Errorf("idempotency check failed (network): %v", err)
+		}
+		return fmt.Errorf("FATAL: idempotency check logic error: %v", err)
 	}
 	if alreadyProcessed {
 		l.Info("Message already processed, skipping to ACK")
@@ -99,7 +103,6 @@ func (h *SyncHandler) ProcessMessage(ctx context.Context, entry models.OutboxEnt
 	}
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		// Create a fresh context for each attempt with the dynamic duration
 		txCtx, txCancel := context.WithTimeout(ctx, opTimeout)
 		err = h.executeTransaction(txCtx, entry, payload, pkColumn, tableName)
 		txCancel()
@@ -109,17 +112,11 @@ func (h *SyncHandler) ProcessMessage(ctx context.Context, entry models.OutboxEnt
 			return nil
 		}
 
-		// Detect Deadlock/Lock Conflict
 		if h.isDeadlock(err) {
 			lastErr = err
-
-			// Increment lock retry counter
 			metrics.ConsumerRetries.WithLabelValues(tableName).Inc()
 
-			// Internal linear backoff for locks (quick retry strategy)
-			// Attempt 1: 200ms, Attempt 2: 400ms, Attempt 3: 600ms
 			backoff := time.Duration(attempt) * 200 * time.Millisecond
-
 			l.Warn("Firebird lock contention detected, retrying internally",
 				"attempt", attempt,
 				"backoff", backoff,
@@ -130,9 +127,11 @@ func (h *SyncHandler) ProcessMessage(ctx context.Context, entry models.OutboxEnt
 			continue
 		}
 
-		// Non-recoverable error (Syntax, Constraint Violation, etc)
-		// Fail fast without retrying
-		return err
+		if h.isNetworkError(err) {
+			return err
+		}
+
+		return fmt.Errorf("FATAL: database execution error: %v", err)
 	}
 
 	return fmt.Errorf("failed after %d attempts (last error: %v)", maxRetries, lastErr)
@@ -211,4 +210,27 @@ func (h *SyncHandler) isDeadlock(err error) bool {
 		strings.Contains(msg, "lock conflict") ||
 		strings.Contains(msg, "concurrent update") ||
 		strings.Contains(msg, "335544336")
+}
+
+// isNetworkError detects infra or logical errors for retry
+func (h *SyncHandler) isNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Erro de timeout do contexto
+	if strings.Contains(err.Error(), "context deadline exceeded") {
+		return true
+	}
+
+	// Erros de socket/rede
+	if _, ok := err.(net.Error); ok {
+		return true
+	}
+
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "dial tcp")
 }

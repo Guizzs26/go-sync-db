@@ -31,7 +31,9 @@ func NewFirebirdRepository(connString string, logger *slog.Logger) (*FirebirdRep
 	db.SetConnMaxLifetime(30 * time.Minute)
 	db.SetConnMaxIdleTime(10 * time.Minute)
 
-	if err := db.Ping(); err != nil {
+	pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.PingContext(pingCtx); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("firebird ping failed: %v", err)
 	}
@@ -47,8 +49,11 @@ func NewFirebirdRepository(connString string, logger *slog.Logger) (*FirebirdRep
 // GetNextID emulates the Delphi application protocol by incrementing the INDICE table
 // This operation must be executed within the same transaction as the main insertion
 func (r *FirebirdRepository) GetNextID(ctx context.Context, tx *sql.Tx, generatorName string) (int, error) {
+	opCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
 	updateQuery := `UPDATE INDICE SET VALOR = VALOR + 1 WHERE NOME = ?`
-	res, err := tx.ExecContext(ctx, updateQuery, generatorName)
+	res, err := tx.ExecContext(opCtx, updateQuery, generatorName)
 	if err != nil {
 		return 0, fmt.Errorf("failed to increment index %s: %v", generatorName, err)
 	}
@@ -59,7 +64,7 @@ func (r *FirebirdRepository) GetNextID(ctx context.Context, tx *sql.Tx, generato
 
 	var nextID int
 	selectQuery := `SELECT VALOR FROM INDICE WHERE NOME = ?`
-	err = tx.QueryRowContext(ctx, selectQuery, generatorName).Scan(&nextID)
+	err = tx.QueryRowContext(opCtx, selectQuery, generatorName).Scan(&nextID)
 	if err != nil {
 		return 0, fmt.Errorf("failed to retrieve updated index %s: %v", generatorName, err)
 	}
@@ -71,10 +76,13 @@ func (r *FirebirdRepository) GetNextID(ctx context.Context, tx *sql.Tx, generato
 // IsProcessed checks if a correlation_id has already been synchronized
 // This is the core mechanism for absolute idempotency
 func (r *FirebirdRepository) IsProcessed(ctx context.Context, correlationID string) (bool, error) {
+	opCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
 	query := `SELECT FIRST 1 1 FROM SYNC_CONTROL WHERE CORRELATION_ID = ?`
 
 	var exists bool
-	err := r.db.QueryRowContext(ctx, query, correlationID).Scan(&exists)
+	err := r.db.QueryRowContext(opCtx, query, correlationID).Scan(&exists)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
@@ -87,9 +95,12 @@ func (r *FirebirdRepository) IsProcessed(ctx context.Context, correlationID stri
 
 // MarkAsProcessed records the correlation_id in the SYNC_CONTROL table
 func (r *FirebirdRepository) MarkAsProcessed(ctx context.Context, tx *sql.Tx, correlationID string) error {
+	opCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
 	query := `INSERT INTO SYNC_CONTROL (CORRELATION_ID) VALUES (?)`
 
-	_, err := tx.ExecContext(ctx, query, correlationID)
+	_, err := tx.ExecContext(opCtx, query, correlationID)
 	if err != nil {
 		msg := strings.ToLower(err.Error())
 		if strings.Contains(msg, "violation") || strings.Contains(msg, "unique") || strings.Contains(msg, "primary") {

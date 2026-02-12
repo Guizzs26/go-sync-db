@@ -147,6 +147,42 @@ func (r *RabbitMQClient) Publish(ctx context.Context, routingKey string, entry m
 	}
 }
 
+// Consume registers a handler for a specific queue (used for feedback loop)
+func (r *RabbitMQClient) Consume(ctx context.Context, queueName string, handler func(ctx context.Context, body []byte) error) error {
+	msgs, err := r.channel.Consume(
+		queueName,
+		"",    // consumer tag
+		false, // auto-ack (we handle manually for safety)
+		false, // exclusive
+		false, // no-local
+		false, // no-wait
+		nil,   // args
+	)
+	if err != nil {
+		return err
+	}
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case d, ok := <-msgs:
+				if !ok {
+					return
+				}
+				if err := handler(ctx, d.Body); err != nil {
+					r.logger.Error("Feedback: failed to process error message", "error", err)
+					d.Nack(false, true) // Requeue on transient handler error
+					continue
+				}
+				d.Ack(false)
+			}
+		}
+	}()
+	return nil
+}
+
 // Close gracefully shuts down the RabbitMQ resources
 func (r *RabbitMQClient) Close() error {
 	r.closeOnce.Do(func() {
