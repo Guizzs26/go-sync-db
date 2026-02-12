@@ -168,28 +168,30 @@ func (r *PostgresRepository) MoveToDLQ(ctx context.Context) error {
 	defer cancel()
 
 	query := `
-        WITH poison_pills AS (
-            SELECT id FROM pg_sync_outbox
-            WHERE attempts >= 5
-              AND status IN ('pending', 'error') 
-              AND updated_at < NOW() - INTERVAL '10 minutes'
-            FOR UPDATE SKIP LOCKED 
-            LIMIT 100
-        ),
-        deleted AS (
-            DELETE FROM pg_sync_outbox
-            WHERE id IN (SELECT id FROM poison_pills)
-            RETURNING *
-        )
-        INSERT INTO pg_sync_dlq (
-            correlation_id, unit_id, table_name, operation, 
-            payload, attempts, error_log, failed_at
-        )
-        SELECT 
-            correlation_id, unit_id, table_name, operation,
-            payload, attempts, error_log, NOW()
-        FROM deleted
-        RETURNING correlation_id;`
+		WITH poison_pills AS (
+			SELECT id FROM pg_sync_outbox
+			WHERE (
+				attempts >= 5                 -- Mensagens que falharam muito (infra)
+				OR status = 'error'           -- Mensagens com erro fatal confirmado (feedback)
+			)
+			AND updated_at < NOW() - INTERVAL '1 minute'
+			FOR UPDATE SKIP LOCKED 
+			LIMIT 100
+		),
+		deleted AS (
+			DELETE FROM pg_sync_outbox
+			WHERE id IN (SELECT id FROM poison_pills)
+			RETURNING *
+		)
+		INSERT INTO pg_sync_dlq (
+			correlation_id, unit_id, table_name, operation, 
+			payload, attempts, error_log, failed_at
+		)
+		SELECT 
+			correlation_id, unit_id, table_name, operation,
+			payload, attempts, error_log, NOW()
+		FROM deleted
+		RETURNING correlation_id;`
 
 	rows, err := r.pool.Query(opCtx, query)
 	if err != nil {
