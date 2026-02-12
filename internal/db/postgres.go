@@ -264,7 +264,7 @@ func (r *PostgresRepository) MarkAsErrorByCorrelationID(ctx context.Context, cor
 		SET status = 'error', 
 		    error_log = LEFT(COALESCE(error_log, '') || ' | [Feedback] ' || $2, 2000), 
 		    updated_at = NOW() 
-		WHERE correlation_id = $1`
+		WHERE correlation_id = $1::uuid`
 
 	_, err := r.pool.Exec(opCtx, query, correlationID, errLog)
 	return err

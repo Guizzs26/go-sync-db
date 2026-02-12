@@ -18,7 +18,8 @@ import (
 // RabbitMQClient handles the low-level communication with the message broker
 type RabbitMQClient struct {
 	conn       *amqp.Connection
-	channel    *amqp.Channel
+	channel    *amqp.Channel // publishing channel
+	consumeCh  *amqp.Channel // consuming channel
 	logger     *slog.Logger
 	connClosed chan *amqp.Error
 	chanClosed chan *amqp.Error
@@ -41,6 +42,14 @@ func NewRabbitMQClient(url string, l *slog.Logger) (*RabbitMQClient, error) {
 		return nil, fmt.Errorf("failed to open RabbitMQ channel: %v", err)
 	}
 
+	// Create a second channel for the Feedback Loop
+	cCh, err := c.Channel()
+	if err != nil {
+		ch.Close()
+		c.Close()
+		return nil, fmt.Errorf("failed to open consuming channel: %v", err)
+	}
+
 	if err := ch.ExchangeDeclare(
 		"pax.topic",
 		"topic",
@@ -51,12 +60,14 @@ func NewRabbitMQClient(url string, l *slog.Logger) (*RabbitMQClient, error) {
 		nil,
 	); err != nil {
 		ch.Close()
+		cCh.Close()
 		c.Close()
 		return nil, fmt.Errorf("failed to declare topic exchange: %v", err)
 	}
 
 	if err := ch.Confirm(false); err != nil {
 		ch.Close()
+		cCh.Close()
 		c.Close()
 		return nil, fmt.Errorf("failed to activate Publisher Confirms: %v", err)
 	}
@@ -65,6 +76,7 @@ func NewRabbitMQClient(url string, l *slog.Logger) (*RabbitMQClient, error) {
 	client := &RabbitMQClient{
 		conn:       c,
 		channel:    ch,
+		consumeCh:  cCh,
 		logger:     l,
 		connClosed: make(chan *amqp.Error, 1),
 		chanClosed: make(chan *amqp.Error, 1),
@@ -149,14 +161,14 @@ func (r *RabbitMQClient) Publish(ctx context.Context, routingKey string, entry m
 
 // Consume registers a handler for a specific queue (used for feedback loop)
 func (r *RabbitMQClient) Consume(ctx context.Context, queueName string, handler func(ctx context.Context, body []byte) error) error {
-	msgs, err := r.channel.Consume(
+	msgs, err := r.consumeCh.Consume(
 		queueName,
-		"",    // consumer tag
-		false, // auto-ack (we handle manually for safety)
-		false, // exclusive
-		false, // no-local
-		false, // no-wait
-		nil,   // args
+		"",
+		false,
+		false,
+		false,
+		false,
+		nil,
 	)
 	if err != nil {
 		return err
@@ -171,9 +183,10 @@ func (r *RabbitMQClient) Consume(ctx context.Context, queueName string, handler 
 				if !ok {
 					return
 				}
+				// Start processing the dead letter
 				if err := handler(ctx, d.Body); err != nil {
-					r.logger.Error("Feedback: failed to process error message", "error", err)
-					d.Nack(false, true) // Requeue on transient handler error
+					r.logger.Error("Feedback: handler failed", "error", err)
+					d.Nack(false, true) // Requeue for retry
 					continue
 				}
 				d.Ack(false)

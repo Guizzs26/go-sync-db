@@ -32,16 +32,9 @@ func (b *Backoff) Next() time.Duration {
 
 	jitterFactor := rand.Float64()*0.4 - 0.2
 	jitter := time.Duration(jitterFactor * float64(b.current))
-	wait := b.current + jitter
+	wait := max(b.current+jitter, b.minDelay)
 
-	if wait < b.minDelay {
-		wait = b.minDelay
-	}
-
-	b.current = time.Duration(float64(b.current) * b.multiplier)
-	if b.current > b.maxDelay {
-		b.current = b.maxDelay
-	}
+	b.current = min(time.Duration(float64(b.current)*b.multiplier), b.maxDelay)
 
 	return wait
 }
