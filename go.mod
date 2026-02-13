@@ -3,11 +3,13 @@ module github.com/Guizzs26/go-sync-db
 go 1.25.0
 
 require (
+	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.8.0
 	github.com/joho/godotenv v1.5.1
 	github.com/nakagami/firebirdsql v0.9.15
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rabbitmq/amqp091-go v1.10.0
+	golang.org/x/text v0.29.0
 )
 
 require (
@@ -30,7 +32,6 @@ require (
 	golang.org/x/exp v0.0.0-20250106191152-7588d65b2ba8 // indirect
 	golang.org/x/sync v0.17.0 // indirect
 	golang.org/x/sys v0.35.0 // indirect
-	golang.org/x/text v0.29.0 // indirect
 	google.golang.org/protobuf v1.36.8 // indirect
 	modernc.org/mathutil v1.4.2-0.20220822142738-b13e5b564332 // indirect
 )

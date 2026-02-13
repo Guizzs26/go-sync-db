@@ -215,3 +215,33 @@ func (r *RabbitMQClient) Close() error {
 func (r *RabbitMQClient) IsHealthy() bool {
 	return r.healthy.Load()
 }
+
+// FB -> PG //
+
+// PublishToExchange publishes a message to a specific exchange
+// This is used by the Collector to send data to the "pax.fb.to.hq" exchange
+func (r *RabbitMQClient) PublishToExchange(ctx context.Context, exchange, routingKey string, payload any) error {
+	if !r.IsHealthy() {
+		return fmt.Errorf("broker connection is closed")
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to serialize payload: %v", err)
+	}
+
+	// We use the main channel for publishing
+	return r.channel.PublishWithContext(
+		ctx,
+		exchange,
+		routingKey,
+		false,
+		false,
+		amqp.Publishing{
+			ContentType:  "application/json",
+			DeliveryMode: amqp.Persistent,
+			Body:         body,
+			Timestamp:    time.Now(),
+		},
+	)
+}

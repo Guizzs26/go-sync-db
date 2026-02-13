@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Guizzs26/go-sync-db/internal/models"
+	"github.com/Guizzs26/go-sync-db/pkg/encoding"
 	_ "github.com/nakagami/firebirdsql"
 )
 
@@ -124,4 +126,125 @@ func (r *FirebirdRepository) BeginTx(ctx context.Context) (*sql.Tx, error) {
 func (r *FirebirdRepository) Close() error {
 	r.logger.Info("Closing Firebird connection pool")
 	return r.db.Close()
+}
+
+// ---------- FB -> PG ---------- //
+
+// FetchOutboxPending retrieves the oldest N records from the local sync queue
+func (r *FirebirdRepository) FetchOutboxPending(ctx context.Context, limit int) ([]models.FBOutboxRecord, error) {
+	opCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	query := `
+		SELECT FIRST ? ID, TABLE_NAME, OP_TYPE, PK_VALUE, CREATED_AT 
+		FROM FB_SYNC_OUTBOX 
+		ORDER BY ID ASC`
+
+	rows, err := r.db.QueryContext(opCtx, query, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query outbox: %w", err)
+	}
+	defer rows.Close()
+
+	var records []models.FBOutboxRecord
+	for rows.Next() {
+		var rec models.FBOutboxRecord
+		if err := rows.Scan(&rec.ID, &rec.TableName, &rec.OpType, &rec.PKValue, &rec.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan error in outbox: %w", err)
+		}
+		records = append(records, rec)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return records, nil
+}
+
+// FetchFullRecord retrieves the actual data row from the source table dynamically
+// It handles column discovery and WIN1252 -> UTF8 conversion automatically
+func (r *FirebirdRepository) FetchFullRecord(ctx context.Context, tableName string, pkValue string) (map[string]any, error) {
+	opCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	// Resolve Primary Key Column Name (Security & Mapping)
+	pkCol := resolvePKColumn(tableName)
+	if pkCol == "" {
+		return nil, fmt.Errorf("unknown primary key for table %s", tableName)
+	}
+
+	// Dynamic Query Construction (Safe due to whitelist in resolvePKColumn)
+	query := fmt.Sprintf("SELECT * FROM %s WHERE %s = ?", tableName, pkCol)
+
+	rows, err := r.db.QueryContext(opCtx, query, pkValue)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query full record: %w", err)
+	}
+	defer rows.Close()
+
+	// Dynamic Column Scanning
+	// Since we don't know the schema at compile time, we must verify columns dynamically
+	if !rows.Next() {
+		return nil, sql.ErrNoRows // Record might have been physically deleted
+	}
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	// Create a slice of any to hold pointers to values
+	values := make([]any, len(columns))
+	valuePtrs := make([]any, len(columns))
+	for i := range values {
+		valuePtrs[i] = &values[i]
+	}
+
+	if err := rows.Scan(valuePtrs...); err != nil {
+		return nil, err
+	}
+
+	// 4. Map Construction and Charset Conversion
+	result := make(map[string]any)
+	for i, colName := range columns {
+		val := values[i]
+
+		// Firebird often returns []byte for strings. We must decode WIN1252
+		switch v := val.(type) {
+		case []byte:
+			result[colName] = encoding.ToUTF8(v)
+		case nil:
+			result[colName] = nil
+		default:
+			result[colName] = v
+		}
+	}
+
+	return result, nil
+}
+
+// DeleteOutbox removes the log entry after successful publishing
+func (r *FirebirdRepository) DeleteOutbox(ctx context.Context, id int64) error {
+	opCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	query := `DELETE FROM FB_SYNC_OUTBOX WHERE ID = ?`
+	_, err := r.db.ExecContext(opCtx, query, id)
+	return err
+}
+
+// resolvePKColumn maps table names to their Legacy Primary Key column names
+// This prevents SQL injection and handles inconsistent naming
+func resolvePKColumn(tableName string) string {
+	switch strings.ToUpper(tableName) {
+	case "CLIENTE":
+		return "IDCLIENTE"
+	case "CONTATO":
+		return "ID"
+	case "PARCELAS_CLIENTE":
+		return "PARCELA_ID"
+	default:
+		return ""
+	}
 }
