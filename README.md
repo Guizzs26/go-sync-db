@@ -9,7 +9,7 @@ OBS:
 
 A arquitetura:
 
-Evitamos o antipadrão de Dual-Write (escrever em dois bancos simultaneamente), que inevitavelmente causa inconsistências em caso de falhas parciais. Em vez disso, adotamos o 'Transactional Outbox Pattern'.
+Evitei o antipadrão de Dual-Write (escrever em dois bancos simultaneamente), que inevitavelmente causa inconsistências em caso de falhas parciais. Em vez disso, adotei o 'Transactional Outbox Pattern'.
 
 O fluxo PG -> FB
 
@@ -45,7 +45,6 @@ Agora vamos falar do serviço principal desse fluxo:
 - Whitelist de segunça. O relay valida o nome da tabela e o tipo da operação antes de publicar. Isso impede que metadados malformados ou tabelas não autorizadas cheguem na mensageria.
 - Memory Guard para prevenção de OOM durante o processamento em batch
 - Temos controle de I/O com context e timeout.
-- Sem panic
 - Separação de responsabilidades claras, seguindo boas prátiacs de engenharia de software (documentação, clean code, solid quando necessário, design pattern simples de acordo com o Go idiomático).
 
 3. O RabbitMQ garante a seguranças das mensagens em filas persistentes.
